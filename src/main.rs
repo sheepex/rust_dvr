@@ -1,4 +1,5 @@
 use eframe::egui;
+mod playback;
 mod video;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -12,6 +13,7 @@ use url::Url;
 enum Tab {
     Equipment,
     Live,
+    Playback,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -125,14 +127,91 @@ fn camera_url(
     Ok(url)
 }
 
+#[derive(Default)]
+struct VideoSlot {
+    camera: Option<(String, u32)>,
+    frames: Option<Receiver<video::Event>>,
+    errors: Option<Receiver<&'static str>>,
+    cancel: Option<tokio::sync::oneshot::Sender<()>>,
+    texture: Option<egui::TextureHandle>,
+}
+
+impl VideoSlot {
+    fn stop(&mut self) {
+        self.frames = None;
+        self.errors = None;
+        if let Some(cancel) = self.cancel.take() {
+            let _ = cancel.send(());
+        }
+        self.texture = None;
+        self.camera = None;
+    }
+
+    fn start(
+        &mut self,
+        url: Url,
+        credentials: retina::client::Credentials,
+        camera: (String, u32),
+        ctx: &egui::Context,
+    ) {
+        self.stop();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let (error_sender, error_receiver) = mpsc::channel();
+        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+        let ctx = ctx.clone();
+        thread::spawn(move || {
+            let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                let _ = error_sender.send("Não foi possível iniciar o vídeo.");
+                ctx.request_repaint();
+                return;
+            };
+            runtime.block_on(async {
+                tokio::select! {
+                    _ = cancel_rx => {},
+                    result = video::run(url, credentials, sender, Some(ctx.clone())) => {
+                        if let Err(error) = result { let _ = error_sender.send(error); ctx.request_repaint(); }
+                    }
+                }
+            });
+        });
+        self.frames = Some(receiver);
+        self.errors = Some(error_receiver);
+        self.cancel = Some(cancel_tx);
+        self.camera = Some(camera);
+    }
+}
+
+fn resize_grid(slots: &mut [VideoSlot; 16], selected: &mut usize, side: usize) {
+    let count = side * side;
+    for slot in &mut slots[count..] {
+        slot.stop();
+    }
+    if *selected >= count {
+        *selected = 0;
+    }
+}
+
+fn next_slot(current: usize, side: usize) -> usize {
+    (current + 1) % (side * side)
+}
+
 struct Viewer {
     tab: Tab,
     equipment_tab_open: bool,
     live_tab_open: bool,
+    playback_tab_open: bool,
     edit_open: bool,
     selected_slot: usize,
-    video_slot: Option<usize>,
-    camera_filter: String,
+    slots: [VideoSlot; 16],
+    grid_side: usize,
+    playback_slots: [VideoSlot; 4],
+    playback_slot: usize,
+    playback_camera: Option<(usize, u32)>,
+    playback_start: String,
+    playback_end: String,
     equipment: Vec<Equipment>,
     load_failed: bool,
     selected: Option<usize>,
@@ -146,9 +225,6 @@ struct Viewer {
     channel: u32,
     secondary: bool,
     custom_url: String,
-    frames: Option<Receiver<video::Event>>,
-    cancel: Option<tokio::sync::oneshot::Sender<()>>,
-    texture: Option<egui::TextureHandle>,
     status: String,
 }
 
@@ -163,13 +239,19 @@ impl Default for Viewer {
             Err(error) => (Vec::new(), error, true),
         };
         Self {
-            tab: Tab::Equipment,
-            equipment_tab_open: true,
-            live_tab_open: false,
+            tab: Tab::Live,
+            equipment_tab_open: false,
+            live_tab_open: true,
+            playback_tab_open: false,
             edit_open: false,
             selected_slot: 0,
-            video_slot: None,
-            camera_filter: String::new(),
+            slots: std::array::from_fn(|_| VideoSlot::default()),
+            grid_side: 2,
+            playback_slots: std::array::from_fn(|_| VideoSlot::default()),
+            playback_slot: 0,
+            playback_camera: None,
+            playback_start: String::new(),
+            playback_end: String::new(),
             equipment,
             load_failed,
             selected: None,
@@ -183,15 +265,178 @@ impl Default for Viewer {
             channel: 1,
             secondary: true,
             custom_url: String::new(),
-            frames: None,
-            cancel: None,
-            texture: None,
             status,
         }
     }
 }
 
 impl Viewer {
+    fn playback_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.horizontal_top(|ui| {
+            ui.allocate_ui_with_layout(
+                egui::vec2(220.0, ui.available_height()),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    ui.heading("Reprodução");
+                    ui.label("Selecione uma câmera");
+                    let list_height = (ui.available_height() - 230.0).max(50.0);
+                    egui::ScrollArea::vertical()
+                        .id_salt("playback_tree")
+                        .max_height(list_height)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            for (index, item) in self.equipment.iter().enumerate() {
+                                egui::CollapsingHeader::new(&item.name)
+                                    .id_salt(("playback_equipment", index))
+                                    .show(ui, |ui| {
+                                        for channel in 1..=item.channels {
+                                            if ui
+                                                .selectable_label(
+                                                    self.playback_camera == Some((index, channel)),
+                                                    format!("Câmera {channel}"),
+                                                )
+                                                .clicked()
+                                            {
+                                                self.playback_camera = Some((index, channel));
+                                            }
+                                        }
+                                    });
+                            }
+                        });
+                    ui.separator();
+                    ui.label("Início (hora do DVR)");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.playback_start)
+                            .hint_text("AAAA-MM-DD HH:MM:SS"),
+                    );
+                    ui.label("Fim (hora do DVR)");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.playback_end)
+                            .hint_text("AAAA-MM-DD HH:MM:SS"),
+                    );
+                    if ui.button("Reproduzir").clicked() {
+                        if let Err(error) = self.connect_playback(ctx) {
+                            self.status = error;
+                        }
+                    }
+                    ui.small("Intelbras · H.264");
+                },
+            );
+            ui.separator();
+            ui.vertical(|ui| {
+                let available = ui.available_size();
+                let spacing = ui.spacing().item_spacing;
+                let width = ((available.x - spacing.x) / 2.0).max(1.0);
+                let height = ((available.y - 42.0 - spacing.y) / 2.0).max(1.0);
+                for row in 0..2 {
+                    ui.horizontal(|ui| {
+                        for col in 0..2 {
+                            let index = row * 2 + col;
+                            let (rect, response) = ui.allocate_exact_size(
+                                egui::vec2(width, height),
+                                egui::Sense::click(),
+                            );
+                            if response.clicked() {
+                                self.playback_slot = index;
+                            }
+                            response.context_menu(|ui| {
+                                if ui
+                                    .add_enabled(
+                                        self.playback_slots[index].camera.is_some(),
+                                        egui::Button::new("Desconectar"),
+                                    )
+                                    .clicked()
+                                {
+                                    self.playback_slots[index].stop();
+                                    self.status =
+                                        format!("Reprodução do quadro {} encerrada.", index + 1);
+                                    ui.close_menu();
+                                }
+                                if ui
+                                    .add_enabled(
+                                        self.playback_slots
+                                            .iter()
+                                            .any(|slot| slot.camera.is_some()),
+                                        egui::Button::new("Fechar todas as câmeras"),
+                                    )
+                                    .clicked()
+                                {
+                                    for slot in &mut self.playback_slots {
+                                        slot.stop();
+                                    }
+                                    self.status = "Reproduções encerradas.".into();
+                                    ui.close_menu();
+                                }
+                            });
+                            ui.painter().rect_filled(
+                                rect,
+                                0.0,
+                                egui::Color32::from_rgb(20, 23, 26),
+                            );
+                            ui.painter().rect_stroke(
+                                rect,
+                                0.0,
+                                egui::Stroke::new(
+                                    if self.playback_slot == index {
+                                        2.0_f32
+                                    } else {
+                                        1.0
+                                    },
+                                    if self.playback_slot == index {
+                                        egui::Color32::from_rgb(35, 130, 255)
+                                    } else {
+                                        egui::Color32::GRAY
+                                    },
+                                ),
+                                egui::StrokeKind::Inside,
+                            );
+                            if let Some(texture) = &self.playback_slots[index].texture {
+                                let size = egui::vec2(rect.width(), rect.height()).min(egui::vec2(
+                                    rect.height() * texture.size()[0] as f32
+                                        / texture.size()[1] as f32,
+                                    rect.width() * texture.size()[1] as f32
+                                        / texture.size()[0] as f32,
+                                ));
+                                ui.painter().image(
+                                    texture.id(),
+                                    egui::Rect::from_center_size(rect.center(), size),
+                                    egui::Rect::from_min_max(
+                                        egui::Pos2::ZERO,
+                                        egui::pos2(1.0, 1.0),
+                                    ),
+                                    egui::Color32::WHITE,
+                                );
+                            } else {
+                                let text = if self.playback_slots[index].camera.is_some() {
+                                    "Conectando…"
+                                } else {
+                                    "Selecione uma câmera e um período"
+                                };
+                                ui.painter().text(
+                                    rect.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    text,
+                                    egui::FontId::proportional(13.0),
+                                    egui::Color32::GRAY,
+                                );
+                            }
+                        }
+                    });
+                }
+                ui.separator();
+                ui.label(
+                    "Linha do tempo indisponível: consulta das gravações ainda não autenticada.",
+                );
+            });
+        });
+    }
+
+    fn set_grid_side(&mut self, side: usize) {
+        debug_assert!((1..=4).contains(&side));
+        resize_grid(&mut self.slots, &mut self.selected_slot, side);
+        self.grid_side = side;
+    }
+
     fn save(&mut self) {
         if self.load_failed {
             self.status =
@@ -276,12 +521,9 @@ impl Viewer {
     }
 
     fn stop(&mut self) {
-        self.frames = None;
-        if let Some(cancel) = self.cancel.take() {
-            let _ = cancel.send(());
+        for slot in &mut self.slots {
+            slot.stop();
         }
-        self.texture = None;
-        self.video_slot = None;
     }
 
     fn connect(&mut self, ctx: &egui::Context) -> Result<(), String> {
@@ -309,30 +551,52 @@ impl Viewer {
         };
         url.set_username("").map_err(|_| "URL inválida.")?;
         url.set_password(None).map_err(|_| "URL inválida.")?;
-        self.stop();
-        let (sender, receiver) = mpsc::sync_channel(1);
-        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
-        let ctx = ctx.clone();
-        thread::spawn(move || {
-            let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            else {
-                return;
-            };
-            runtime.block_on(async {
-                tokio::select! {
-                    _ = cancel_rx => {},
-                    result = video::run(url, credentials, sender.clone(), Some(ctx.clone())) => {
-                        if let Err(error) = result { let _ = sender.try_send(video::Event::Status(error)); ctx.request_repaint(); }
-                    }
-                }
-            });
-        });
-        self.frames = Some(receiver);
-        self.cancel = Some(cancel_tx);
-        self.video_slot = Some(self.selected_slot);
+        let index = self.selected.ok_or("Selecione um equipamento.")?;
+        self.slots[self.selected_slot].start(
+            url,
+            credentials,
+            (self.equipment[index].id.clone(), self.channel),
+            ctx,
+        );
         self.status = "Conectando…".into();
+        self.selected_slot = next_slot(self.selected_slot, self.grid_side);
+        Ok(())
+    }
+
+    fn connect_playback(&mut self, ctx: &egui::Context) -> Result<(), String> {
+        let (index, channel) = self.playback_camera.ok_or("Selecione uma câmera.")?;
+        let equipment = &self.equipment[index];
+        if equipment.brand != Brand::Intelbras {
+            return Err("Reprodução disponível apenas para Intelbras nesta versão.".into());
+        }
+        let base = camera_url(
+            equipment.brand,
+            &equipment.host,
+            equipment.port,
+            "",
+            "",
+            channel,
+            true,
+        )?;
+        let url = playback::url(base, channel, &self.playback_start, &self.playback_end)?;
+        let password = credential(&equipment.id)
+            .and_then(|entry| entry.get_password())
+            .map_err(|_| "Não foi possível acessar a senha salva do equipamento.")?;
+        let credentials = retina::client::Credentials {
+            username: equipment.username.clone(),
+            password,
+        };
+        self.playback_slots[self.playback_slot].start(
+            url,
+            credentials,
+            (equipment.id.clone(), channel),
+            ctx,
+        );
+        self.status = format!(
+            "Conectando reprodução no quadro {}…",
+            self.playback_slot + 1
+        );
+        self.playback_slot = (self.playback_slot + 1) % self.playback_slots.len();
         Ok(())
     }
 }
@@ -340,47 +604,71 @@ impl Viewer {
 impl Drop for Viewer {
     fn drop(&mut self) {
         self.stop();
+        for slot in &mut self.playback_slots {
+            slot.stop();
+        }
     }
 }
 
-impl eframe::App for Viewer {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if let Some(receiver) = &self.frames {
+fn update_slots(slots: &mut [VideoSlot], ctx: &egui::Context, status: &mut String, label: &str) {
+    for (index, slot) in slots.iter_mut().enumerate() {
+        if let Some(receiver) = &slot.frames {
             if let Ok(event) = receiver.try_recv() {
                 match event {
                     video::Event::Frame(frame) => {
                         let image =
                             egui::ColorImage::from_rgb([frame.width, frame.height], &frame.rgb);
-                        if let Some(texture) = &mut self.texture {
+                        if let Some(texture) = &mut slot.texture {
                             texture.set(image, egui::TextureOptions::LINEAR);
                         } else {
-                            self.texture = Some(ctx.load_texture(
-                                "camera",
+                            slot.texture = Some(ctx.load_texture(
+                                format!("{label}-{index}"),
                                 image,
                                 egui::TextureOptions::LINEAR,
                             ));
                         }
-                        self.status = "Recebendo vídeo.".into();
                     }
-                    video::Event::Status(message) => self.status = message.into(),
+                    video::Event::Status(message) => *status = message.into(),
                 }
             }
         }
+        if let Some(message) = slot
+            .errors
+            .as_ref()
+            .and_then(|errors| errors.try_recv().ok())
+        {
+            *status = format!("{label}, quadro {}: {message}", index + 1);
+            slot.stop();
+        }
+    }
+}
+
+impl eframe::App for Viewer {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        update_slots(&mut self.slots, ctx, &mut self.status, "Ao vivo");
+        update_slots(
+            &mut self.playback_slots,
+            ctx,
+            &mut self.status,
+            "Reprodução",
+        );
 
         egui::TopBottomPanel::top("tabs").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.menu_button("☰ Menu", |ui| {
-                    if ui.button("Equipamentos").clicked() {
-                        self.equipment_tab_open = true;
-                        self.tab = Tab::Equipment;
-                        ui.close_menu();
-                    }
                     if ui.button("Visualização ao vivo").clicked() {
                         self.live_tab_open = true;
                         self.tab = Tab::Live;
-                        if let Some(index) = self.selected {
-                            self.select(index);
-                        }
+                        ui.close_menu();
+                    }
+                    if ui.button("Reprodução").clicked() {
+                        self.playback_tab_open = true;
+                        self.tab = Tab::Playback;
+                        ui.close_menu();
+                    }
+                    if ui.button("Equipamentos").clicked() {
+                        self.equipment_tab_open = true;
+                        self.tab = Tab::Equipment;
                         ui.close_menu();
                     }
                 });
@@ -398,8 +686,12 @@ impl eframe::App for Viewer {
                         .clicked()
                     {
                         self.equipment_tab_open = false;
-                        if self.tab == Tab::Equipment && self.live_tab_open {
-                            self.tab = Tab::Live;
+                        if self.tab == Tab::Equipment {
+                            if self.live_tab_open {
+                                self.tab = Tab::Live;
+                            } else if self.playback_tab_open {
+                                self.tab = Tab::Playback;
+                            }
                         }
                     }
                 }
@@ -409,9 +701,6 @@ impl eframe::App for Viewer {
                         .clicked()
                     {
                         self.tab = Tab::Live;
-                        if let Some(index) = self.selected {
-                            self.select(index);
-                        }
                     }
                     if ui
                         .small_button("×")
@@ -420,15 +709,47 @@ impl eframe::App for Viewer {
                     {
                         self.live_tab_open = false;
                         self.stop();
-                        if self.tab == Tab::Live && self.equipment_tab_open {
-                            self.tab = Tab::Equipment;
+                        if self.tab == Tab::Live {
+                            if self.playback_tab_open {
+                                self.tab = Tab::Playback;
+                            } else if self.equipment_tab_open {
+                                self.tab = Tab::Equipment;
+                            }
+                        }
+                    }
+                }
+                if self.playback_tab_open {
+                    if ui
+                        .selectable_label(self.tab == Tab::Playback, "Reprodução")
+                        .clicked()
+                    {
+                        self.tab = Tab::Playback;
+                    }
+                    if ui
+                        .small_button("×")
+                        .on_hover_text("Fechar aba de reprodução")
+                        .clicked()
+                    {
+                        self.playback_tab_open = false;
+                        for slot in &mut self.playback_slots {
+                            slot.stop();
+                        }
+                        if self.tab == Tab::Playback {
+                            if self.live_tab_open {
+                                self.tab = Tab::Live;
+                            } else if self.equipment_tab_open {
+                                self.tab = Tab::Equipment;
+                            }
                         }
                     }
                 }
             });
         });
+        egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
+            ui.label(&self.status);
+        });
         egui::CentralPanel::default().show(ctx, |ui| {
-            if !self.equipment_tab_open && !self.live_tab_open {
+            if !self.equipment_tab_open && !self.live_tab_open && !self.playback_tab_open {
                 ui.heading("Visor DVR");
                 ui.label("Abra uma aba pelo menu.");
             } else if self.tab == Tab::Equipment {
@@ -485,6 +806,8 @@ impl eframe::App for Viewer {
                     self.select(index);
                     self.edit_open = true;
                 }
+            } else if self.tab == Tab::Playback {
+                self.playback_ui(ui, ctx);
             } else {
                 ui.horizontal_top(|ui| {
                     ui.allocate_ui_with_layout(
@@ -492,93 +815,115 @@ impl eframe::App for Viewer {
                         egui::Layout::top_down(egui::Align::Min),
                         |ui| {
                             ui.heading("Câmeras");
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.camera_filter)
-                                    .hint_text("Buscar equipamento"),
-                            );
                             ui.separator();
-                            let mut selection = None;
+                            let mut connect_camera = None;
+                            let mut disconnect_camera = None;
+                            let mut disconnect_all = false;
+                            let list_height = (ui.available_height() - 36.0).max(0.0);
                             egui::ScrollArea::vertical()
-                                .max_height(250.0)
+                                .max_height(list_height)
+                                .auto_shrink([false, false])
                                 .show(ui, |ui| {
                                     for (index, item) in self.equipment.iter().enumerate() {
-                                        if !item
-                                            .name
-                                            .to_lowercase()
-                                            .contains(&self.camera_filter.to_lowercase())
-                                        {
-                                            continue;
-                                        }
                                         egui::CollapsingHeader::new(&item.name)
                                             .id_salt(("camera_tree", index))
                                             .show(ui, |ui| {
                                                 for channel in 1..=item.channels {
-                                                    if ui
-                                                        .selectable_label(
-                                                            self.selected == Some(index)
-                                                                && self.channel == channel,
-                                                            format!("Câmera {channel}"),
+                                                    let active = self.slots.iter().any(|slot| {
+                                                        slot.camera.as_ref().is_some_and(
+                                                            |(id, current)| {
+                                                                id == &item.id
+                                                                    && *current == channel
+                                                            },
                                                         )
-                                                        .clicked()
-                                                    {
-                                                        selection = Some((index, channel));
+                                                    });
+                                                    let response = ui.selectable_label(
+                                                        active,
+                                                        format!("Câmera {channel}"),
+                                                    );
+                                                    if response.double_clicked() {
+                                                        connect_camera = Some((index, channel));
                                                     }
+                                                    response.context_menu(|ui| {
+                                                        if ui
+                                                            .add_enabled(
+                                                                active,
+                                                                egui::Button::new("Desconectar"),
+                                                            )
+                                                            .clicked()
+                                                        {
+                                                            disconnect_camera =
+                                                                Some((item.id.clone(), channel));
+                                                            ui.close_menu();
+                                                        }
+                                                        if ui
+                                                            .add_enabled(
+                                                                self.slots.iter().any(|slot| {
+                                                                    slot.camera.is_some()
+                                                                }),
+                                                                egui::Button::new(
+                                                                    "Fechar todas as câmeras",
+                                                                ),
+                                                            )
+                                                            .clicked()
+                                                        {
+                                                            disconnect_all = true;
+                                                            ui.close_menu();
+                                                        }
+                                                    });
                                                 }
                                             });
                                     }
                                 });
-                            if let Some((index, channel)) = selection {
-                                if self.selected != Some(index) {
-                                    self.select(index);
-                                }
+                            if let Some((index, channel)) = connect_camera {
+                                self.select(index);
                                 self.channel = channel;
+                                if let Err(error) = self.connect(ctx) {
+                                    self.status = error;
+                                }
                             }
-                            ui.separator();
-                            if self.selected.is_some() {
-                                ui.label(format!("Câmera selecionada: {}", self.channel));
-                                ui.label("Senha");
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut self.password).password(true),
-                                );
-                                if ui.button("Salvar senha").clicked() {
-                                    if self.password.is_empty() {
-                                        self.status = "Informe uma senha para salvar.".into();
-                                    } else if let Some(index) = self.selected {
-                                        self.status = match credential(&self.equipment[index].id)
-                                            .and_then(|entry| entry.set_password(&self.password))
-                                        {
-                                            Ok(()) => "Senha salva no armazenamento seguro do sistema.".into(),
-                                            Err(_) => "Não foi possível salvar a senha no armazenamento seguro do sistema.".into(),
-                                        };
+                            if let Some(camera) = disconnect_camera {
+                                for slot in &mut self.slots {
+                                    if slot.camera.as_ref() == Some(&camera) {
+                                        slot.stop();
                                     }
                                 }
-                                ui.checkbox(&mut self.secondary, "Fluxo secundário");
-                                if ui.button("Visualizar câmera").clicked() {
-                                    if let Err(error) = self.connect(ctx) {
-                                        self.status = error;
-                                    }
-                                }
-                                if ui.button("Desconectar").clicked() {
-                                    self.stop();
-                                    self.status = "Desconectado.".into();
-                                }
-                            } else {
-                                ui.label("Escolha uma câmera na lista.");
+                                self.status = "Desconectado.".into();
+                            }
+                            if disconnect_all {
+                                self.stop();
+                                self.status = "Todas as câmeras foram desconectadas.".into();
                             }
                             ui.separator();
-                            ui.label(&self.status);
-                            ui.small("Por enquanto, apenas uma câmera simultânea.");
+                            ui.horizontal(|ui| {
+                                for side in 1..=4 {
+                                    if ui
+                                        .selectable_label(
+                                            self.grid_side == side,
+                                            format!("{}", side * side),
+                                        )
+                                        .on_hover_text(format!("{} quadro(s)", side * side))
+                                        .clicked()
+                                    {
+                                        self.set_grid_side(side);
+                                    }
+                                }
+                            });
                         },
                     );
                     ui.separator();
                     let available = ui.available_size();
-                    let width = (available.x / 2.0 - 4.0).max(20.0);
-                    let height = (available.y / 2.0 - 4.0).max(20.0);
+                    let side = self.grid_side;
+                    let spacing = ui.spacing().item_spacing;
+                    let width =
+                        ((available.x - spacing.x * (side - 1) as f32) / side as f32).max(1.0);
+                    let height =
+                        ((available.y - spacing.y * (side - 1) as f32) / side as f32).max(1.0);
                     ui.vertical(|ui| {
-                        for row in 0..2 {
+                        for row in 0..side {
                             ui.horizontal(|ui| {
-                                for col in 0..2 {
-                                    let index = row * 2 + col;
+                                for col in 0..side {
+                                    let index = row * side + col;
                                     let (rect, response) = ui.allocate_exact_size(
                                         egui::vec2(width, height),
                                         egui::Sense::click(),
@@ -586,6 +931,32 @@ impl eframe::App for Viewer {
                                     if response.clicked() {
                                         self.selected_slot = index;
                                     }
+                                    response.context_menu(|ui| {
+                                        if ui
+                                            .add_enabled(
+                                                self.slots[index].camera.is_some(),
+                                                egui::Button::new("Desconectar"),
+                                            )
+                                            .clicked()
+                                        {
+                                            self.slots[index].stop();
+                                            self.status =
+                                                format!("Quadro {} desconectado.", index + 1);
+                                            ui.close_menu();
+                                        }
+                                        if ui
+                                            .add_enabled(
+                                                self.slots.iter().any(|slot| slot.camera.is_some()),
+                                                egui::Button::new("Fechar todas as câmeras"),
+                                            )
+                                            .clicked()
+                                        {
+                                            self.stop();
+                                            self.status =
+                                                "Todas as câmeras foram desconectadas.".into();
+                                            ui.close_menu();
+                                        }
+                                    });
                                     ui.painter().rect_filled(
                                         rect,
                                         0.0,
@@ -608,12 +979,14 @@ impl eframe::App for Viewer {
                                         ),
                                         egui::StrokeKind::Inside,
                                     );
-                                    if self.video_slot == Some(index) {
-                                        if let Some(texture) = &self.texture {
+                                    if self.slots[index].camera.is_some() {
+                                        if let Some(texture) = &self.slots[index].texture {
                                             let size = egui::vec2(rect.width(), rect.height()).min(
                                                 egui::vec2(
-                                                    rect.height() * texture.size()[0] as f32 / texture.size()[1] as f32,
-                                                    rect.width() * texture.size()[1] as f32 / texture.size()[0] as f32,
+                                                    rect.height() * texture.size()[0] as f32
+                                                        / texture.size()[1] as f32,
+                                                    rect.width() * texture.size()[1] as f32
+                                                        / texture.size()[0] as f32,
                                                 ),
                                             );
                                             let image_rect =
@@ -726,6 +1099,58 @@ fn main() -> eframe::Result {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selection_advances_and_wraps_for_every_grid_size() {
+        for side in 1..=4 {
+            let count = side * side;
+            assert_eq!(next_slot(count - 1, side), 0);
+            if count > 1 {
+                assert_eq!(next_slot(0, side), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn reducing_grid_disconnects_only_hidden_slots() {
+        let mut slots: [VideoSlot; 16] = std::array::from_fn(|_| VideoSlot::default());
+        let (visible_tx, mut visible_rx) = tokio::sync::oneshot::channel();
+        let (hidden_tx, mut hidden_rx) = tokio::sync::oneshot::channel();
+        slots[3].camera = Some(("dvr".into(), 4));
+        slots[3].cancel = Some(visible_tx);
+        slots[4].camera = Some(("dvr".into(), 5));
+        slots[4].cancel = Some(hidden_tx);
+        let mut selected = 8;
+        resize_grid(&mut slots, &mut selected, 2);
+        assert_eq!(selected, 0);
+        assert_eq!(hidden_rx.try_recv(), Ok(()));
+        assert!(matches!(
+            visible_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        assert!(slots[3].camera.is_some());
+        assert!(slots[4].camera.is_none());
+    }
+
+    #[test]
+    fn stopping_one_slot_does_not_stop_another() {
+        let mut slots: [VideoSlot; 4] = std::array::from_fn(|_| VideoSlot::default());
+        let (first_tx, mut first_rx) = tokio::sync::oneshot::channel();
+        let (second_tx, mut second_rx) = tokio::sync::oneshot::channel();
+        slots[0].camera = Some(("dvr".into(), 1));
+        slots[0].cancel = Some(first_tx);
+        slots[1].camera = Some(("dvr".into(), 2));
+        slots[1].cancel = Some(second_tx);
+
+        slots[0].stop();
+        assert_eq!(first_rx.try_recv(), Ok(()));
+        assert!(matches!(
+            second_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        assert!(slots[0].camera.is_none());
+        assert_eq!(slots[1].camera, Some(("dvr".into(), 2)));
+    }
 
     #[test]
     fn intelbras_url_encodes_credentials() {

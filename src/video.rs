@@ -11,6 +11,8 @@ pub struct Frame {
 
 pub enum Event {
     Frame(Frame),
+    // The diagnostic binary sends status through the same channel.
+    #[allow(dead_code)]
     Status(&'static str),
 }
 
