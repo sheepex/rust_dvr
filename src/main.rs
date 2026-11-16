@@ -130,6 +130,7 @@ fn camera_url(
 #[derive(Default)]
 struct VideoSlot {
     camera: Option<(String, u32)>,
+    secondary: Option<bool>,
     frames: Option<Receiver<video::Event>>,
     errors: Option<Receiver<&'static str>>,
     cancel: Option<tokio::sync::oneshot::Sender<()>>,
@@ -145,6 +146,7 @@ impl VideoSlot {
         }
         self.texture = None;
         self.camera = None;
+        self.secondary = None;
     }
 
     fn start(
@@ -198,6 +200,18 @@ fn next_slot(current: usize, side: usize) -> usize {
     (current + 1) % (side * side)
 }
 
+fn toggle_expanded(current: Option<usize>, index: usize) -> Option<usize> {
+    if current == Some(index) {
+        None
+    } else {
+        Some(index)
+    }
+}
+
+fn use_secondary(side: usize, expanded: Option<usize>, index: usize) -> bool {
+    side >= 3 && expanded != Some(index)
+}
+
 struct Viewer {
     tab: Tab,
     equipment_tab_open: bool,
@@ -207,6 +221,8 @@ struct Viewer {
     selected_slot: usize,
     slots: [VideoSlot; 16],
     grid_side: usize,
+    expanded_slot: Option<usize>,
+    quality_layout: (usize, Option<usize>),
     playback_slots: [VideoSlot; 4],
     playback_slot: usize,
     playback_camera: Option<(usize, u32)>,
@@ -223,7 +239,6 @@ struct Viewer {
     username: String,
     password: String,
     channel: u32,
-    secondary: bool,
     custom_url: String,
     status: String,
 }
@@ -247,6 +262,8 @@ impl Default for Viewer {
             selected_slot: 0,
             slots: std::array::from_fn(|_| VideoSlot::default()),
             grid_side: 2,
+            expanded_slot: None,
+            quality_layout: (2, None),
             playback_slots: std::array::from_fn(|_| VideoSlot::default()),
             playback_slot: 0,
             playback_camera: None,
@@ -263,7 +280,6 @@ impl Default for Viewer {
             username: String::new(),
             password: String::new(),
             channel: 1,
-            secondary: true,
             custom_url: String::new(),
             status,
         }
@@ -319,7 +335,7 @@ impl Viewer {
                             self.status = error;
                         }
                     }
-                    ui.small("Intelbras · H.264");
+                    ui.small("Intelbras · H.264/H.265");
                 },
             );
             ui.separator();
@@ -432,9 +448,10 @@ impl Viewer {
     }
 
     fn set_grid_side(&mut self, side: usize) {
-        debug_assert!((1..=4).contains(&side));
+        debug_assert!((2..=4).contains(&side));
         resize_grid(&mut self.slots, &mut self.selected_slot, side);
         self.grid_side = side;
+        self.expanded_slot = None;
     }
 
     fn save(&mut self) {
@@ -527,6 +544,7 @@ impl Viewer {
     }
 
     fn connect(&mut self, ctx: &egui::Context) -> Result<(), String> {
+        let secondary = use_secondary(self.grid_side, self.expanded_slot, self.selected_slot);
         let url = if self.brand == Brand::Custom {
             let url = Url::parse(&self.custom_url).map_err(|_| "URL inválida.")?;
             if url.scheme() != "rtsp" || url.host().is_none() {
@@ -541,7 +559,7 @@ impl Viewer {
                 &self.username,
                 &self.password,
                 self.channel,
-                self.secondary,
+                secondary,
             )?
         };
         let mut url = url;
@@ -558,9 +576,59 @@ impl Viewer {
             (self.equipment[index].id.clone(), self.channel),
             ctx,
         );
+        self.slots[self.selected_slot].secondary = Some(secondary);
         self.status = "Conectando…".into();
-        self.selected_slot = next_slot(self.selected_slot, self.grid_side);
+        if self.expanded_slot.is_none() {
+            self.selected_slot = next_slot(self.selected_slot, self.grid_side);
+        }
         Ok(())
+    }
+
+    fn sync_live_quality(&mut self, ctx: &egui::Context) {
+        for index in 0..self.grid_side * self.grid_side {
+            let desired = use_secondary(self.grid_side, self.expanded_slot, index);
+            let slot = &self.slots[index];
+            if slot.secondary == Some(desired) || slot.camera.is_none() {
+                continue;
+            }
+            let Some((id, channel)) = slot.camera.clone() else {
+                continue;
+            };
+            let Some(equipment) = self.equipment.iter().find(|item| item.id == id) else {
+                self.status =
+                    "Não foi possível ajustar o fluxo: equipamento não encontrado.".into();
+                continue;
+            };
+            let url = match camera_url(
+                equipment.brand,
+                &equipment.host,
+                equipment.port,
+                "",
+                "",
+                channel,
+                desired,
+            ) {
+                Ok(url) => url,
+                Err(error) => {
+                    self.status = error.into();
+                    continue;
+                }
+            };
+            let password = match credential(&id).and_then(|entry| entry.get_password()) {
+                Ok(password) => password,
+                Err(_) => {
+                    self.status = "Não foi possível acessar a senha para ajustar o fluxo.".into();
+                    continue;
+                }
+            };
+            let credentials = retina::client::Credentials {
+                username: equipment.username.clone(),
+                password,
+            };
+            self.slots[index].start(url, credentials, (id, channel), ctx);
+            self.slots[index].secondary = Some(desired);
+            self.status = "Ajustando a qualidade das câmeras…".into();
+        }
     }
 
     fn connect_playback(&mut self, ctx: &egui::Context) -> Result<(), String> {
@@ -709,6 +777,7 @@ impl eframe::App for Viewer {
                     {
                         self.live_tab_open = false;
                         self.stop();
+                        self.expanded_slot = None;
                         if self.tab == Tab::Live {
                             if self.playback_tab_open {
                                 self.tab = Tab::Playback;
@@ -819,7 +888,7 @@ impl eframe::App for Viewer {
                             let mut connect_camera = None;
                             let mut disconnect_camera = None;
                             let mut disconnect_all = false;
-                            let list_height = (ui.available_height() - 36.0).max(0.0);
+                            let list_height = (ui.available_height() - 60.0).max(0.0);
                             egui::ScrollArea::vertical()
                                 .max_height(list_height)
                                 .auto_shrink([false, false])
@@ -896,7 +965,7 @@ impl eframe::App for Viewer {
                             }
                             ui.separator();
                             ui.horizontal(|ui| {
-                                for side in 1..=4 {
+                                for side in 2..=4 {
                                     if ui
                                         .selectable_label(
                                             self.grid_side == side,
@@ -909,11 +978,17 @@ impl eframe::App for Viewer {
                                     }
                                 }
                             });
+                            ui.small("Qualidade ajustada à grade.");
                         },
                     );
                     ui.separator();
                     let available = ui.available_size();
-                    let side = self.grid_side;
+                    let expanded = self.expanded_slot;
+                    let side = if expanded.is_some() {
+                        1
+                    } else {
+                        self.grid_side
+                    };
                     let spacing = ui.spacing().item_spacing;
                     let width =
                         ((available.x - spacing.x * (side - 1) as f32) / side as f32).max(1.0);
@@ -923,13 +998,17 @@ impl eframe::App for Viewer {
                         for row in 0..side {
                             ui.horizontal(|ui| {
                                 for col in 0..side {
-                                    let index = row * side + col;
+                                    let index = expanded.unwrap_or(row * side + col);
                                     let (rect, response) = ui.allocate_exact_size(
                                         egui::vec2(width, height),
                                         egui::Sense::click(),
                                     );
                                     if response.clicked() {
                                         self.selected_slot = index;
+                                    }
+                                    if response.double_clicked() {
+                                        self.selected_slot = index;
+                                        self.expanded_slot = toggle_expanded(expanded, index);
                                     }
                                     response.context_menu(|ui| {
                                         if ui
@@ -1081,6 +1160,11 @@ impl eframe::App for Viewer {
                 });
             self.edit_open &= open;
         }
+        let layout = (self.grid_side, self.expanded_slot);
+        if layout != self.quality_layout {
+            self.quality_layout = layout;
+            self.sync_live_quality(ctx);
+        }
     }
 }
 
@@ -1099,6 +1183,36 @@ fn main() -> eframe::Result {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_stream_quality_follows_grid_and_expansion() {
+        for index in 0..4 {
+            assert!(!use_secondary(2, None, index));
+        }
+        for side in [3, 4] {
+            for index in 0..side * side {
+                assert!(use_secondary(side, None, index));
+                assert_eq!(use_secondary(side, Some(5), index), index != 5);
+            }
+        }
+        assert!(!use_secondary(2, Some(1), 1));
+    }
+
+    #[test]
+    fn double_click_toggles_expansion_without_affecting_other_slots() {
+        let mut slots: [VideoSlot; 16] = std::array::from_fn(|_| VideoSlot::default());
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        slots[1].camera = Some(("dvr".into(), 2));
+        slots[1].cancel = Some(tx);
+        let expanded = toggle_expanded(None, 3);
+        assert_eq!(expanded, Some(3));
+        assert_eq!(toggle_expanded(expanded, 3), None);
+        assert_eq!(slots[1].camera, Some(("dvr".into(), 2)));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+    }
 
     #[test]
     fn selection_advances_and_wraps_for_every_grid_size() {

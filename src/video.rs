@@ -2,6 +2,7 @@ use futures::StreamExt;
 use retina::client::{Credentials, PlayOptions, Session, SessionOptions, SetupOptions};
 use std::sync::mpsc::SyncSender;
 use std::time::Duration;
+use std::time::Instant;
 
 pub struct Frame {
     pub width: usize,
@@ -47,6 +48,127 @@ fn convert(frame: &rust_h264::decoder::Frame) -> Option<Frame> {
     })
 }
 
+fn convert_h265(frame: &rust_h265::decoder::Frame) -> Option<Frame> {
+    convert_h265_planes(
+        frame.width as usize,
+        frame.height as usize,
+        frame.bit_depth,
+        frame.chroma_format_idc,
+        [&frame.y, &frame.u, &frame.v],
+    )
+}
+
+fn convert_h265_planes(
+    w: usize,
+    h: usize,
+    bit_depth: u8,
+    chroma_format: u32,
+    planes: [&rust_h265::PixelData; 3],
+) -> Option<Frame> {
+    use rust_h265::PixelData;
+    let [y_plane, u_plane, v_plane] = planes;
+    if w == 0 || h == 0 || w.checked_mul(h)? > 8_294_400 || !(8..=12).contains(&bit_depth) {
+        return None;
+    }
+    let (cw, ch) = match chroma_format {
+        1 => (w.div_ceil(2), h.div_ceil(2)),
+        3 => (w, h),
+        _ => return None,
+    };
+    if y_plane.len() < w.checked_mul(h)?
+        || u_plane.len() < cw.checked_mul(ch)?
+        || v_plane.len() < cw.checked_mul(ch)?
+    {
+        return None;
+    }
+    let sample = |plane: &PixelData, index: usize| -> f32 {
+        let value = match plane {
+            PixelData::U8(data) => u16::from(data[index]),
+            PixelData::U16(data) => data[index],
+        };
+        (value >> (bit_depth - 8)) as f32
+    };
+    let mut rgb = Vec::with_capacity(w * h * 3);
+    for y in 0..h {
+        for x in 0..w {
+            let ci = (y * ch / h) * cw + x * cw / w;
+            let l = (sample(y_plane, y * w + x) - 16.0) * 1.164;
+            let u = sample(u_plane, ci) - 128.0;
+            let v = sample(v_plane, ci) - 128.0;
+            rgb.push((l + 1.596 * v).clamp(0.0, 255.0) as u8);
+            rgb.push((l - 0.392 * u - 0.813 * v).clamp(0.0, 255.0) as u8);
+            rgb.push((l + 2.017 * u).clamp(0.0, 255.0) as u8);
+        }
+    }
+    Some(Frame {
+        width: w,
+        height: h,
+        rgb,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rust_h265::PixelData;
+
+    #[test]
+    fn converts_h265_420_planes_at_eight_and_ten_bits() {
+        let y8 = PixelData::U8(vec![16, 235, 16, 235]);
+        let u8 = PixelData::U8(vec![128]);
+        let v8 = PixelData::U8(vec![128]);
+        let y10 = PixelData::U16(vec![64, 940, 64, 940]);
+        let u10 = PixelData::U16(vec![512]);
+        let v10 = PixelData::U16(vec![512]);
+        let image8 = convert_h265_planes(2, 2, 8, 1, [&y8, &u8, &v8]).unwrap();
+        let image10 = convert_h265_planes(2, 2, 10, 1, [&y10, &u10, &v10]).unwrap();
+        assert_eq!(image8.rgb, image10.rgb);
+        assert_eq!(&image8.rgb[..3], &[0, 0, 0]);
+        assert!(image8.rgb[3] >= 254);
+    }
+
+    #[test]
+    fn rejects_unsupported_chroma_and_short_planes() {
+        let plane = PixelData::U8(vec![128]);
+        assert!(convert_h265_planes(2, 2, 8, 2, [&plane, &plane, &plane]).is_none());
+        assert!(convert_h265_planes(2, 2, 8, 1, [&plane, &plane, &plane]).is_none());
+    }
+}
+
+fn h265_decode_nal(
+    decoder: &mut rust_h265::Decoder,
+    nal: &rust_h265::NalUnit<'_>,
+) -> Result<(), &'static str> {
+    match decoder.decode_nal(nal) {
+        Ok(_) => Ok(()),
+        Err(rust_h265::DecodeError::Unsupported(_)) => {
+            Err("Perfil ou recurso H.265 não suportado pelo decodificador.")
+        }
+        Err(rust_h265::DecodeError::ResourceLimit(_)) => {
+            Err("O vídeo H.265 excede os limites do decodificador.")
+        }
+        // Corrupt or incomplete packets may recover at the next keyframe.
+        Err(_) => Ok(()),
+    }
+}
+
+fn send_frame(
+    frames: &SyncSender<Event>,
+    ctx: &Option<eframe::egui::Context>,
+    image: Frame,
+) -> bool {
+    match frames.try_send(Event::Frame(image)) {
+        Ok(()) => {
+            if let Some(ctx) = ctx {
+                ctx.request_repaint();
+            }
+            true
+        }
+        Err(std::sync::mpsc::TrySendError::Full(_)) => true,
+        Err(std::sync::mpsc::TrySendError::Disconnected(_)) => false,
+    }
+}
+
 pub async fn run(
     url: url::Url,
     credentials: Credentials,
@@ -64,8 +186,11 @@ pub async fn run(
         .iter()
         .position(|s| s.media() == "video")
         .ok_or("O equipamento não anunciou vídeo nesse canal.")?;
-    if session.streams()[index].encoding_name().to_lowercase() != "h264" {
-        return Err("Codec não suportado nesta versão: somente H.264 integrado; H.265 ainda não implementado.");
+    let codec = session.streams()[index]
+        .encoding_name()
+        .to_ascii_lowercase();
+    if codec != "h264" && codec != "h265" {
+        return Err("Codec não suportado: use H.264 ou H.265.");
     }
     tokio::time::timeout(
         Duration::from_secs(12),
@@ -85,7 +210,9 @@ pub async fn run(
         .demuxed()
         .map_err(|_| "Formato de vídeo RTSP incompatível.")?;
     let mut decoder = rust_h264::decoder::Decoder::new();
+    let mut decoder_h265 = rust_h265::Decoder::new().with_display_order();
     let mut extra = Vec::new();
+    let mut last_decoded = Instant::now();
     loop {
         let item = tokio::time::timeout(Duration::from_secs(20), stream.next())
             .await
@@ -93,32 +220,58 @@ pub async fn run(
             .ok_or("A transmissão foi encerrada.")?
             .map_err(|_| "Erro ao receber o vídeo RTSP.")?;
         if let retina::codec::CodecItem::VideoFrame(frame) = item {
+            if frame.stream_id() != index {
+                continue;
+            }
             if let Some(retina::codec::ParametersRef::Video(params)) =
                 stream.streams()[index].parameters()
             {
                 if params.extra_data() != extra {
                     extra = params.extra_data().to_vec();
-                    if let Ok(config) = rust_h264::nal::parse_avcc_config(&extra) {
-                        for nal in config.sps_nals.iter().chain(config.pps_nals.iter()) {
-                            let _ = decoder.decode_nal(nal);
+                    if codec == "h264" {
+                        if let Ok(config) = rust_h264::nal::parse_avcc_config(&extra) {
+                            for nal in config.sps_nals.iter().chain(config.pps_nals.iter()) {
+                                let _ = decoder.decode_nal(nal);
+                            }
+                        }
+                    } else if let retina::codec::VideoParametersCodec::H265 { vps, sps, pps } =
+                        params.codec_params()
+                    {
+                        decoder_h265 = rust_h265::Decoder::new().with_display_order();
+                        for data in [vps, sps, pps] {
+                            let nal =
+                                rust_h265::parse_nal(data).ok_or("Parâmetros H.265 inválidos.")?;
+                            h265_decode_nal(&mut decoder_h265, &nal)?;
                         }
                     }
                 }
             }
-            for nal in rust_h264::nal::parse_avcc(frame.data(), 4) {
-                if let Ok(Some(decoded)) = decoder.decode_nal(&nal) {
-                    if let Some(image) = convert(&decoded) {
-                        match frames.try_send(Event::Frame(image)) {
-                            Ok(()) => {
-                                if let Some(ctx) = &ctx {
-                                    ctx.request_repaint();
-                                }
+            if codec == "h264" {
+                for nal in rust_h264::nal::parse_avcc(frame.data(), 4) {
+                    if let Ok(Some(decoded)) = decoder.decode_nal(&nal) {
+                        if let Some(image) = convert(&decoded) {
+                            last_decoded = Instant::now();
+                            if !send_frame(&frames, &ctx, image) {
+                                return Ok(());
                             }
-                            Err(std::sync::mpsc::TrySendError::Full(_)) => {}
-                            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => return Ok(()),
                         }
                     }
                 }
+            } else {
+                for nal in rust_h265::parse_hvcc(frame.data(), 4) {
+                    h265_decode_nal(&mut decoder_h265, &nal)?;
+                    while let Some(decoded) = decoder_h265.next_output() {
+                        let image = convert_h265(&decoded)
+                            .ok_or("Formato de imagem H.265 não suportado.")?;
+                        last_decoded = Instant::now();
+                        if !send_frame(&frames, &ctx, image) {
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+            if last_decoded.elapsed() > Duration::from_secs(30) {
+                return Err("Vídeo recebido, mas não foi possível decodificar quadros.");
             }
         }
     }
