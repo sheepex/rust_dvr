@@ -4,6 +4,9 @@ use std::sync::mpsc::SyncSender;
 use std::time::Duration;
 use std::time::Instant;
 
+#[path = "hik.rs"]
+mod hik;
+
 pub struct Frame {
     pub width: usize,
     pub height: usize,
@@ -133,6 +136,31 @@ mod tests {
         assert!(convert_h265_planes(2, 2, 8, 2, [&plane, &plane, &plane]).is_none());
         assert!(convert_h265_planes(2, 2, 8, 1, [&plane, &plane, &plane]).is_none());
     }
+
+    #[test]
+    fn reports_invalid_h265_parameters_without_exposing_stream_details() {
+        let error = "sps_max_sub_layers_minus1 must be in [0, 6]\nprivate stream data";
+        assert_eq!(
+            receive_error("h265", error),
+            "Parâmetros H.265 inválidos. O fluxo pode estar criptografado ou ser incompatível."
+        );
+        assert_eq!(
+            receive_error("h264", error),
+            "Erro ao receber o vídeo RTSP."
+        );
+        assert_eq!(
+            receive_error("h265", "outro erro"),
+            "Erro ao receber o vídeo RTSP."
+        );
+    }
+}
+
+fn receive_error(codec: &str, detail: &str) -> &'static str {
+    if codec == "h265" && detail.contains("sps_max_sub_layers_minus1 must be in [0, 6]") {
+        "Parâmetros H.265 inválidos. O fluxo pode estar criptografado ou ser incompatível."
+    } else {
+        "Erro ao receber o vídeo RTSP."
+    }
 }
 
 fn h265_decode_nal(
@@ -175,6 +203,11 @@ pub async fn run(
     frames: SyncSender<Event>,
     ctx: Option<eframe::egui::Context>,
 ) -> Result<(), &'static str> {
+    let hik_key = credentials.password.clone();
+    let hik_live = url
+        .path()
+        .to_ascii_lowercase()
+        .starts_with("/streaming/channels/");
     let options = SessionOptions::default().creds(Some(credentials));
     let mut session =
         tokio::time::timeout(Duration::from_secs(12), Session::describe(url, options))
@@ -206,6 +239,9 @@ pub async fn run(
     .await
     .map_err(|_| "Tempo esgotado ao iniciar o vídeo.")?
     .map_err(|_| "O DVR recusou iniciar a transmissão.")?;
+    if hik_live && codec == "h265" {
+        return run_hik_h265(session, index, &hik_key, frames, ctx).await;
+    }
     let mut stream = session
         .demuxed()
         .map_err(|_| "Formato de vídeo RTSP incompatível.")?;
@@ -218,7 +254,7 @@ pub async fn run(
             .await
             .map_err(|_| "Tempo esgotado sem receber vídeo.")?
             .ok_or("A transmissão foi encerrada.")?
-            .map_err(|_| "Erro ao receber o vídeo RTSP.")?;
+            .map_err(|error| receive_error(&codec, &error.to_string()))?;
         if let retina::codec::CodecItem::VideoFrame(frame) = item {
             if frame.stream_id() != index {
                 continue;
@@ -272,6 +308,61 @@ pub async fn run(
             }
             if last_decoded.elapsed() > Duration::from_secs(30) {
                 return Err("Vídeo recebido, mas não foi possível decodificar quadros.");
+            }
+        }
+    }
+}
+
+async fn run_hik_h265(
+    mut session: retina::client::Session<retina::client::Playing>,
+    index: usize,
+    key: &str,
+    frames: SyncSender<Event>,
+    ctx: Option<eframe::egui::Context>,
+) -> Result<(), &'static str> {
+    let mut depacketizer = hik::H265Rtp::new(key);
+    let mut decoder = rust_h265::Decoder::new().with_display_order();
+    if let Some(retina::codec::ParametersRef::Video(params)) = session.streams()[index].parameters()
+    {
+        if let retina::codec::VideoParametersCodec::H265 { vps, sps, pps } = params.codec_params() {
+            for data in [vps, sps, pps] {
+                if let Some(nal) = rust_h265::parse_nal(data) {
+                    h265_decode_nal(&mut decoder, &nal)?;
+                }
+            }
+        }
+    }
+    let mut last_decoded = Instant::now();
+    loop {
+        let packet = tokio::time::timeout(Duration::from_secs(20), session.next())
+            .await
+            .map_err(|_| "Tempo esgotado sem receber vídeo.")?
+            .ok_or("A transmissão foi encerrada.")?
+            .map_err(|_| "Erro ao receber o vídeo RTSP.")?;
+        if let retina::client::PacketItem::Rtp(packet) = packet {
+            if packet.stream_id() != index {
+                continue;
+            }
+            for data in depacketizer.push(
+                packet.raw(),
+                packet.payload(),
+                packet.sequence_number(),
+                packet.loss(),
+            )? {
+                if let Some(nal) = rust_h265::parse_nal(&data) {
+                    h265_decode_nal(&mut decoder, &nal)?;
+                    while let Some(decoded) = decoder.next_output() {
+                        let image = convert_h265(&decoded)
+                            .ok_or("Formato de imagem H.265 não suportado.")?;
+                        last_decoded = Instant::now();
+                        if !send_frame(&frames, &ctx, image) {
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+            if last_decoded.elapsed() > Duration::from_secs(45) {
+                return Err("Não foi possível decodificar o fluxo Hikvision; confira o código de verificação.");
             }
         }
     }
