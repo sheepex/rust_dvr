@@ -1,7 +1,9 @@
 use eframe::egui;
+mod discovery;
 mod playback;
 mod video;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::{
     sync::mpsc::{self, Receiver},
@@ -31,8 +33,14 @@ struct Equipment {
     brand: Brand,
     host: String,
     port: u16,
+    #[serde(default = "default_http_port")]
+    http_port: u16,
     username: String,
     channels: u32,
+}
+
+fn default_http_port() -> u16 {
+    80
 }
 
 fn equipment_path() -> Option<PathBuf> {
@@ -241,6 +249,12 @@ struct Viewer {
     channel: u32,
     custom_url: String,
     status: String,
+    discovery: HashMap<String, (u64, discovery::State)>,
+    discovery_tx: mpsc::Sender<(String, u64, discovery::State)>,
+    discovery_rx: Receiver<(String, u64, discovery::State)>,
+    discovery_started: bool,
+    next_discovery: u64,
+    http_port: u16,
 }
 
 impl Default for Viewer {
@@ -253,6 +267,7 @@ impl Default for Viewer {
             ),
             Err(error) => (Vec::new(), error, true),
         };
+        let (discovery_tx, discovery_rx) = mpsc::channel();
         Self {
             tab: Tab::Live,
             equipment_tab_open: false,
@@ -282,11 +297,78 @@ impl Default for Viewer {
             channel: 1,
             custom_url: String::new(),
             status,
+            discovery: HashMap::new(),
+            discovery_tx,
+            discovery_rx,
+            discovery_started: false,
+            next_discovery: 0,
+            http_port: 80,
         }
     }
 }
 
 impl Viewer {
+    fn start_discovery(&mut self, equipment: Equipment, ctx: &egui::Context) {
+        self.next_discovery += 1;
+        let generation = self.next_discovery;
+        self.discovery.insert(
+            equipment.id.clone(),
+            (generation, discovery::State::Checking),
+        );
+        let sender = self.discovery_tx.clone();
+        let ctx = ctx.clone();
+        thread::spawn(move || {
+            let state = match credential(&equipment.id).and_then(|entry| entry.get_password()) {
+                Ok(password) => discovery::discover(&equipment, password),
+                Err(_) => discovery::State::Unknown("Senha indisponível no armazenamento seguro."),
+            };
+            let _ = sender.send((equipment.id, generation, state));
+            ctx.request_repaint();
+        });
+    }
+
+    fn cameras_for(&self, equipment: &Equipment) -> Vec<discovery::Camera> {
+        if let Some((
+            _,
+            discovery::State::Connected {
+                cameras: Some(cameras),
+            },
+        )) = self.discovery.get(&equipment.id)
+        {
+            return cameras.clone();
+        }
+        (1..=equipment.channels)
+            .map(|channel| discovery::Camera {
+                channel,
+                name: String::new(),
+            })
+            .collect()
+    }
+
+    fn device_title(&self, equipment: &Equipment) -> egui::RichText {
+        let color = match self.discovery.get(&equipment.id).map(|(_, state)| state) {
+            Some(discovery::State::Connected { .. }) => egui::Color32::from_rgb(61, 185, 104),
+            Some(discovery::State::Failed(_)) => egui::Color32::from_rgb(232, 85, 85),
+            _ => egui::Color32::GRAY,
+        };
+        egui::RichText::new(&equipment.name).color(color)
+    }
+
+    fn device_status(&self, equipment: &Equipment) -> &'static str {
+        match self.discovery.get(&equipment.id).map(|(_, state)| state) {
+            Some(discovery::State::Checking) | None => "Verificando…",
+            Some(discovery::State::Connected { cameras: Some(_) }) => {
+                "Conectado; canais obtidos do equipamento."
+            }
+            Some(discovery::State::Connected { cameras: None }) => {
+                "Conectado; usando a quantidade de canais cadastrada."
+            }
+            Some(discovery::State::Failed(reason)) | Some(discovery::State::Unknown(reason)) => {
+                reason
+            }
+        }
+    }
+
     fn playback_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.horizontal_top(|ui| {
             ui.allocate_ui_with_layout(
@@ -296,29 +378,34 @@ impl Viewer {
                     ui.heading("Reprodução");
                     ui.label("Selecione uma câmera");
                     let list_height = (ui.available_height() - 230.0).max(50.0);
+                    let mut playback_selection = None;
                     egui::ScrollArea::vertical()
                         .id_salt("playback_tree")
                         .max_height(list_height)
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
                             for (index, item) in self.equipment.iter().enumerate() {
-                                egui::CollapsingHeader::new(&item.name)
+                                egui::CollapsingHeader::new(self.device_title(item))
                                     .id_salt(("playback_equipment", index))
                                     .show(ui, |ui| {
-                                        for channel in 1..=item.channels {
+                                        for camera in self.cameras_for(item) {
+                                            let channel = camera.channel;
                                             if ui
                                                 .selectable_label(
                                                     self.playback_camera == Some((index, channel)),
-                                                    format!("Câmera {channel}"),
+                                                    discovery::label(&camera),
                                                 )
                                                 .clicked()
                                             {
-                                                self.playback_camera = Some((index, channel));
+                                                playback_selection = Some((index, channel));
                                             }
                                         }
                                     });
                             }
                         });
+                    if let Some(camera) = playback_selection {
+                        self.playback_camera = Some(camera);
+                    }
                     ui.separator();
                     ui.label("Início (hora do DVR)");
                     ui.add(
@@ -486,6 +573,7 @@ impl Viewer {
             brand: self.brand,
             host: self.host.clone(),
             port: self.port,
+            http_port: self.http_port,
             username: self.username.clone(),
             channels: self.channel_count,
         };
@@ -523,6 +611,7 @@ impl Viewer {
         self.brand = equipment.brand;
         self.host = equipment.host.clone();
         self.port = equipment.port;
+        self.http_port = equipment.http_port;
         self.username = equipment.username.clone();
         self.channel_count = equipment.channels;
         self.password = match credential(&equipment.id).and_then(|entry| entry.get_password()) {
@@ -713,6 +802,21 @@ fn update_slots(slots: &mut [VideoSlot], ctx: &egui::Context, status: &mut Strin
 
 impl eframe::App for Viewer {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if !self.discovery_started {
+            self.discovery_started = true;
+            for equipment in self.equipment.clone() {
+                self.start_discovery(equipment, ctx);
+            }
+        }
+        while let Ok((id, generation, state)) = self.discovery_rx.try_recv() {
+            if self
+                .discovery
+                .get(&id)
+                .is_some_and(|(current, _)| *current == generation)
+            {
+                self.discovery.insert(id, (generation, state));
+            }
+        }
         update_slots(&mut self.slots, ctx, &mut self.status, "Ao vivo");
         update_slots(
             &mut self.playback_slots,
@@ -832,6 +936,7 @@ impl eframe::App for Viewer {
                         self.password.clear();
                         self.brand = Brand::Intelbras;
                         self.port = 554;
+                        self.http_port = 80;
                         self.channel_count = 4;
                         self.edit_open = true;
                     }
@@ -839,6 +944,18 @@ impl eframe::App for Viewer {
                         "Equipamentos cadastrados: {}",
                         self.equipment.len()
                     ));
+                    let checking = self
+                        .discovery
+                        .values()
+                        .any(|(_, state)| matches!(state, discovery::State::Checking));
+                    if ui
+                        .add_enabled(!checking, egui::Button::new("Verificar novamente"))
+                        .clicked()
+                    {
+                        for equipment in self.equipment.clone() {
+                            self.start_discovery(equipment, ctx);
+                        }
+                    }
                 });
                 ui.separator();
                 let mut edit = None;
@@ -855,7 +972,8 @@ impl eframe::App for Viewer {
                             ui.strong("Ação");
                             ui.end_row();
                             for (index, equipment) in self.equipment.iter().enumerate() {
-                                ui.label(&equipment.name);
+                                ui.label(self.device_title(equipment))
+                                    .on_hover_text(self.device_status(equipment));
                                 ui.label(&equipment.host);
                                 ui.label(match equipment.brand {
                                     Brand::Intelbras => "Intelbras",
@@ -863,7 +981,9 @@ impl eframe::App for Viewer {
                                     Brand::Custom => "Personalizado",
                                 });
                                 ui.label(equipment.port.to_string());
-                                ui.label(equipment.channels.to_string());
+                                let count = self.cameras_for(equipment).len();
+                                ui.label(count.to_string())
+                                    .on_hover_text(self.device_status(equipment));
                                 if ui.button("Editar").clicked() {
                                     edit = Some(index);
                                 }
@@ -894,10 +1014,12 @@ impl eframe::App for Viewer {
                                 .auto_shrink([false, false])
                                 .show(ui, |ui| {
                                     for (index, item) in self.equipment.iter().enumerate() {
-                                        egui::CollapsingHeader::new(&item.name)
+                                        egui::CollapsingHeader::new(self.device_title(item))
                                             .id_salt(("camera_tree", index))
                                             .show(ui, |ui| {
-                                                for channel in 1..=item.channels {
+                                                ui.small(self.device_status(item));
+                                                for camera in self.cameras_for(item) {
+                                                    let channel = camera.channel;
                                                     let active = self.slots.iter().any(|slot| {
                                                         slot.camera.as_ref().is_some_and(
                                                             |(id, current)| {
@@ -908,7 +1030,7 @@ impl eframe::App for Viewer {
                                                     });
                                                     let response = ui.selectable_label(
                                                         active,
-                                                        format!("Câmera {channel}"),
+                                                        discovery::label(&camera),
                                                     );
                                                     if response.double_clicked() {
                                                         connect_camera = Some((index, channel));
@@ -1134,6 +1256,9 @@ impl eframe::App for Viewer {
                             ui.label("Porta RTSP");
                             ui.add(egui::DragValue::new(&mut self.port).range(1..=u16::MAX));
                             ui.end_row();
+                            ui.label("Porta HTTP");
+                            ui.add(egui::DragValue::new(&mut self.http_port).range(1..=u16::MAX));
+                            ui.end_row();
                             ui.label("Usuário");
                             ui.text_edit_singleline(&mut self.username);
                             ui.end_row();
@@ -1154,6 +1279,9 @@ impl eframe::App for Viewer {
                             && self.status.starts_with("Equipamento salvo")
                         {
                             self.edit_open = false;
+                            if let Some(index) = self.selected {
+                                self.start_discovery(self.equipment[index].clone(), ctx);
+                            }
                         }
                     }
                     ui.label(&self.status);
