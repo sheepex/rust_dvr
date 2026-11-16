@@ -1,5 +1,7 @@
 use futures::StreamExt;
-use retina::client::{Credentials, PlayOptions, Session, SessionOptions, SetupOptions};
+use retina::client::{
+    Credentials, InitialSequenceNumberPolicy, PlayOptions, Session, SessionOptions, SetupOptions,
+};
 use std::sync::mpsc::SyncSender;
 use std::time::Duration;
 use std::time::Instant;
@@ -146,20 +148,90 @@ mod tests {
         );
         assert_eq!(
             receive_error("h264", error),
-            "Erro ao receber o vídeo RTSP."
+            "Erro ao receber o vídeo RTSP (código R0)."
         );
         assert_eq!(
             receive_error("h265", "outro erro"),
-            "Erro ao receber o vídeo RTSP."
+            "Erro ao receber o vídeo RTSP (código R0)."
         );
+    }
+
+    #[test]
+    fn reports_rtsp_status_without_exposing_details() {
+        assert!(describe_error(Some(401)).contains("Autenticação"));
+        assert!(describe_error(Some(403)).contains("permissão"));
+        assert!(describe_error(Some(404)).contains("não encontrado"));
+        assert!(describe_error(None).contains("Falha RTSP"));
+    }
+
+    #[test]
+    fn classifies_receive_errors_without_exposing_private_context() {
+        let secret = "\n\nconn: private address\npkt: private data";
+        for (detail, expected) in [
+            ("wrong ssrc after 2 RTP pkts", "identificador RTP"),
+            ("Out-of-order packet or large loss; expecting seq=Some(Seq { init: PlayResponseHeader, next: 123 })", "R2-início"),
+            ("Out-of-order packet or large loss; expecting seq=Some(Seq { init: RtpPacket, next: 123 })", "R2-contínuo"),
+            ("Out-of-order packet or large loss; expecting ssrc=Some(Ssrc { init: PlayResponseHeader, ssrc: 0x1 }) seq=Some(Seq { init: RtpPacket, next: 123 })", "R2-contínuo"),
+            ("Out-of-order packet or large loss", "R2"),
+            ("Timestamp jumped 100", "horário RTP"),
+            (
+                "Error reading from RTSP peer: connection reset",
+                "conexão RTSP",
+            ),
+            ("RTSP framing error: invalid data", "mensagem RTSP"),
+            ("corrupt RTP header", "cabeçalho RTP"),
+            ("something unexpected", "código R0"),
+        ] {
+            let result = receive_error("h265", &format!("{detail}{secret}"));
+            assert!(result.contains(expected), "{result}");
+            assert!(!result.contains("private"));
+        }
+    }
+
+    #[test]
+    fn identifies_only_hikvision_recorded_tracks_for_initial_sequence_workaround() {
+        assert!(is_hik_playback("/Streaming/tracks/101"));
+        assert!(!is_hik_playback("/Streaming/Channels/101"));
+        assert!(!is_hik_playback("/cam/playback"));
     }
 }
 
 fn receive_error(codec: &str, detail: &str) -> &'static str {
     if codec == "h265" && detail.contains("sps_max_sub_layers_minus1 must be in [0, 6]") {
         "Parâmetros H.265 inválidos. O fluxo pode estar criptografado ou ser incompatível."
+    } else if detail.starts_with("wrong ssrc ") {
+        "Erro de identificador RTP (R1) durante a reprodução ou transmissão."
+    } else if detail.starts_with("Out-of-order packet or large loss") {
+        if detail.contains("seq=Some(Seq { init: PlayResponseHeader") {
+            "Erro de sequência RTP (R2-início): sequência inicial incompatível."
+        } else if detail.contains("seq=Some(Seq { init: RtpPacket") {
+            "Erro de sequência RTP (R2-contínuo): descontinuidade após o início."
+        } else {
+            "Erro de sequência RTP (R2): pacotes fora de ordem ou perda elevada."
+        }
+    } else if detail.starts_with("Timestamp jumped ") {
+        "Erro de horário RTP (R3): salto no tempo dos pacotes."
+    } else if detail.starts_with("Error reading from RTSP peer:") {
+        "Erro de leitura da conexão RTSP (R4): a conexão foi interrompida."
+    } else if detail.starts_with("RTSP framing error:") {
+        "Erro de mensagem RTSP (R5): resposta inesperada do equipamento."
+    } else if detail.starts_with("corrupt RTP header") {
+        "Erro de cabeçalho RTP (R6): pacote inválido recebido."
     } else {
-        "Erro ao receber o vídeo RTSP."
+        "Erro ao receber o vídeo RTSP (código R0)."
+    }
+}
+
+fn is_hik_playback(path: &str) -> bool {
+    path.to_ascii_lowercase().starts_with("/streaming/tracks/")
+}
+
+fn describe_error(status: Option<u16>) -> &'static str {
+    match status {
+        Some(401) => "Autenticação RTSP recusada; confira usuário e senha.",
+        Some(403) => "Acesso RTSP negado; confira a permissão de reprodução.",
+        Some(404) => "Canal ou gravação não encontrado; confira canal e intervalo.",
+        _ => "Falha RTSP: confira endereço, porta, canal, usuário e senha.",
     }
 }
 
@@ -204,16 +276,15 @@ pub async fn run(
     ctx: Option<eframe::egui::Context>,
 ) -> Result<(), &'static str> {
     let hik_key = credentials.password.clone();
-    let hik_live = url
-        .path()
-        .to_ascii_lowercase()
-        .starts_with("/streaming/channels/");
+    let path = url.path().to_ascii_lowercase();
+    let hik_stream =
+        path.starts_with("/streaming/channels/") || path.starts_with("/streaming/tracks/");
     let options = SessionOptions::default().creds(Some(credentials));
     let mut session =
         tokio::time::timeout(Duration::from_secs(12), Session::describe(url, options))
             .await
             .map_err(|_| "Tempo esgotado ao conectar ao DVR.")?
-            .map_err(|_| "Falha RTSP: confira endereço, porta, canal, usuário e senha.")?;
+            .map_err(|error| describe_error(error.status_code()))?;
     let index = session
         .streams()
         .iter()
@@ -232,15 +303,27 @@ pub async fn run(
     .await
     .map_err(|_| "Tempo esgotado ao preparar o vídeo.")?
     .map_err(|_| "Falha ao preparar o vídeo RTSP.")?;
-    let session = tokio::time::timeout(
-        Duration::from_secs(12),
-        session.play(PlayOptions::default()),
-    )
-    .await
-    .map_err(|_| "Tempo esgotado ao iniciar o vídeo.")?
-    .map_err(|_| "O DVR recusou iniciar a transmissão.")?;
-    if hik_live && codec == "h265" {
-        return run_hik_h265(session, index, &hik_key, frames, ctx).await;
+    let play_options = if is_hik_playback(&path) {
+        // Some recorders report an initial sequence unrelated to the first RTP packet.
+        // Keep Retina's normal validation once the stream has started.
+        PlayOptions::default().initial_seq(InitialSequenceNumberPolicy::Ignore)
+    } else {
+        PlayOptions::default()
+    };
+    let session = tokio::time::timeout(Duration::from_secs(12), session.play(play_options))
+        .await
+        .map_err(|_| "Tempo esgotado ao iniciar o vídeo.")?
+        .map_err(|_| "O DVR recusou iniciar a transmissão.")?;
+    if hik_stream && codec == "h265" {
+        return run_hik_h265(
+            session,
+            index,
+            &hik_key,
+            frames,
+            ctx,
+            is_hik_playback(&path),
+        )
+        .await;
     }
     let mut stream = session
         .demuxed()
@@ -319,6 +402,7 @@ async fn run_hik_h265(
     key: &str,
     frames: SyncSender<Event>,
     ctx: Option<eframe::egui::Context>,
+    playback: bool,
 ) -> Result<(), &'static str> {
     let mut depacketizer = hik::H265Rtp::new(key);
     let mut decoder = rust_h265::Decoder::new().with_display_order();
@@ -333,16 +417,31 @@ async fn run_hik_h265(
         }
     }
     let mut last_decoded = Instant::now();
+    let mut sequence_errors = 0u32;
     loop {
-        let packet = tokio::time::timeout(Duration::from_secs(20), session.next())
+        let received = tokio::time::timeout(Duration::from_secs(20), session.next())
             .await
             .map_err(|_| "Tempo esgotado sem receber vídeo.")?
-            .ok_or("A transmissão foi encerrada.")?
-            .map_err(|_| "Erro ao receber o vídeo RTSP.")?;
+            .ok_or("A transmissão foi encerrada.")?;
+        let packet = match received {
+            Ok(packet) => packet,
+            Err(error) => {
+                let detail = error.to_string();
+                if playback && detail.starts_with("Out-of-order packet or large loss") {
+                    depacketizer.discard_fragment();
+                    sequence_errors += 1;
+                    if sequence_errors <= 128 && last_decoded.elapsed() < Duration::from_secs(45) {
+                        continue;
+                    }
+                }
+                return Err(receive_error("h265", &detail));
+            }
+        };
         if let retina::client::PacketItem::Rtp(packet) = packet {
             if packet.stream_id() != index {
                 continue;
             }
+            sequence_errors = 0;
             for data in depacketizer.push(
                 packet.raw(),
                 packet.payload(),

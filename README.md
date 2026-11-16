@@ -22,13 +22,15 @@ A qualidade é automática: na grade de 4 quadros usa-se o fluxo principal; nas 
 
 No menu de contexto de um quadro ou de uma câmera, **Fechar todas as câmeras** desconecta todas as transmissões abertas.
 
-Na aba **Reprodução**, selecione uma câmera Intelbras, um quadro e informe início e fim no formato `AAAA-MM-DD HH:MM:SS`, usando o horário configurado no DVR. Clique em **Reproduzir**. É possível abrir até quatro trechos e fechá-los pelo menu de contexto dos quadros. A reprodução ainda precisa de validação visual de horário e velocidade no equipamento; Hikvision não é suportada nessa aba. A consulta dos períodos gravados, linha do tempo, pausa e avanço ainda não estão implementados.
+Na aba **Reprodução**, selecione uma câmera Intelbras ou Hikvision, um quadro e informe início e fim no formato `AAAA-MM-DD HH:MM:SS`. Para Intelbras, use o horário configurado no DVR; para Hikvision, informe os horários em **UTC**, convertendo-os a partir do fuso do equipamento. Clique em **Reproduzir**. É possível abrir até quatro trechos e fechá-los pelo menu de contexto dos quadros. A reprodução Hikvision ainda precisa ser validada em equipamentos reais; caminhos, faixas de horário e permissões podem variar conforme o modelo. A consulta dos períodos gravados, linha do tempo, pausa e avanço ainda não estão implementados.
+
+Nos campos de data e hora, digite os 14 números em sequência; os separadores são inseridos automaticamente. Por exemplo, `20241116153000` aparece como `2024-11-16 15:30:00`.
 
 A porta cadastrada é a **porta RTSP**, normalmente 554; a porta 37777 de serviço de alguns Intelbras não é a porta RTSP. Consulte a configuração do equipamento para confirmar. Os diagnósticos são aproximados e não substituem o teste com o equipamento.
 
 Os modelos usados para o canal 1 são `/cam/realmonitor?channel=1&subtype=0` (principal) ou `subtype=1` (secundário) para Intelbras, e `/Streaming/Channels/101` (principal) ou `/Streaming/Channels/102` (secundário) para Hikvision. Os caminhos e a disponibilidade variam conforme o modelo e a configuração.
 
-Na visualização ao vivo Hikvision H.265, o aplicativo pode decifrar o formato de criptografia de fluxo testado quando o código de verificação é igual à senha de acesso salva. Códigos distintos ainda não podem ser cadastrados separadamente; outros formatos de criptografia e H.264 criptografado não foram implementados. A compatibilidade pode variar entre modelos.
+Na visualização ao vivo Hikvision H.265, o aplicativo pode decifrar o formato de criptografia de fluxo testado quando o código de verificação é igual à senha de acesso salva. O mesmo tratamento é usado na reprodução H.265, mas ainda não foi validado com gravações. Códigos distintos ainda não podem ser cadastrados separadamente; outros formatos de criptografia e H.264 criptografado não foram implementados. A compatibilidade pode variar entre modelos.
 
 Ao iniciar, o aplicativo verifica os equipamentos em segundo plano e tenta consultar canais e nomes por HTTP, usando a porta HTTP cadastrada (padrão 80) e autenticação Digest. Verde indica conexão aceita, vermelho indica falha, e cinza indica verificação em andamento ou resultado inconclusivo; passe o mouse sobre o nome para detalhes. Quando a consulta de nomes não é suportada, mantém-se a quantidade manual. A lista consultada pode incluir canais configurados sem câmera conectada; ela não confirma o estado individual de cada câmera. Use **Verificar novamente** na aba Equipamentos para atualizar. Não é enviado Basic por HTTP sem proteção.
 

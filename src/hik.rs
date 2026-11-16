@@ -53,6 +53,9 @@ mod tests {
         );
         assert!(receiver.push(&raw, &start, 3, 0).unwrap().is_empty());
         assert!(receiver.push(&raw, &end, 5, 1).unwrap().is_empty());
+        assert!(receiver.push(&raw, &start, 6, 0).unwrap().is_empty());
+        receiver.discard_fragment();
+        assert!(receiver.push(&raw, &end, 7, 0).unwrap().is_empty());
     }
 
     #[test]
@@ -67,6 +70,10 @@ mod tests {
 }
 
 impl H265Rtp {
+    pub fn discard_fragment(&mut self) {
+        self.fragment = None;
+    }
+
     pub fn new(code: &str) -> Self {
         let mut key = [0u8; 16];
         let cipher = if !code.is_empty() && code.is_ascii() && code.len() <= 16 {

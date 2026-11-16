@@ -220,6 +220,66 @@ fn use_secondary(side: usize, expanded: Option<usize>, index: usize) -> bool {
     side >= 3 && expanded != Some(index)
 }
 
+fn datetime_field(ui: &mut egui::Ui, value: &mut String) {
+    let before = value.clone();
+    let mut output = egui::TextEdit::singleline(value)
+        .hint_text("AAAA-MM-DD HH:MM:SS")
+        .show(ui);
+    if output.response.changed() {
+        let range = output.state.cursor.char_range();
+        let edited = value.clone();
+        let cursor = range.map_or(edited.chars().count(), |r| r.primary.index);
+        let mut digits: String = edited
+            .chars()
+            .filter(|c| c.is_ascii_digit())
+            .take(14)
+            .collect();
+        let mut before_cursor = edited
+            .chars()
+            .take(cursor)
+            .filter(|c| c.is_ascii_digit())
+            .count()
+            .min(digits.len());
+        let old_digits: String = before.chars().filter(|c| c.is_ascii_digit()).collect();
+        if digits == old_digits && edited.chars().count() < before.chars().count() {
+            let backspace = ui.input(|i| i.key_pressed(egui::Key::Backspace));
+            let delete = ui.input(|i| i.key_pressed(egui::Key::Delete));
+            if backspace && before_cursor > 0 {
+                digits.remove(before_cursor - 1);
+                before_cursor -= 1;
+            } else if delete && before_cursor < digits.len() {
+                digits.remove(before_cursor);
+            }
+        }
+        *value = playback::mask_datetime(&digits);
+        if let Some(range) = range {
+            let position = |index: usize| {
+                let count = edited
+                    .chars()
+                    .take(index)
+                    .filter(|c| c.is_ascii_digit())
+                    .count()
+                    .min(digits.len());
+                playback::cursor_after_digits(value, count)
+            };
+            let primary = playback::cursor_after_digits(value, before_cursor);
+            let secondary = if range.primary.index == range.secondary.index {
+                primary
+            } else {
+                position(range.secondary.index)
+            };
+            output
+                .state
+                .cursor
+                .set_char_range(Some(egui::text::CCursorRange::two(
+                    egui::text::CCursor::new(primary),
+                    egui::text::CCursor::new(secondary),
+                )));
+            output.state.store(ui.ctx(), output.response.id);
+        }
+    }
+}
+
 struct Viewer {
     tab: Tab,
     equipment_tab_open: bool,
@@ -407,22 +467,32 @@ impl Viewer {
                         self.playback_camera = Some(camera);
                     }
                     ui.separator();
-                    ui.label("Início (hora do DVR)");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.playback_start)
-                            .hint_text("AAAA-MM-DD HH:MM:SS"),
-                    );
-                    ui.label("Fim (hora do DVR)");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.playback_end)
-                            .hint_text("AAAA-MM-DD HH:MM:SS"),
-                    );
+                    let hikvision = self
+                        .playback_camera
+                        .and_then(|(index, _)| self.equipment.get(index))
+                        .is_some_and(|equipment| equipment.brand == Brand::Hikvision);
+                    ui.label(if hikvision {
+                        "Início (UTC)"
+                    } else {
+                        "Início (hora do DVR)"
+                    });
+                    datetime_field(ui, &mut self.playback_start);
+                    ui.label(if hikvision {
+                        "Fim (UTC)"
+                    } else {
+                        "Fim (hora do DVR)"
+                    });
+                    datetime_field(ui, &mut self.playback_end);
                     if ui.button("Reproduzir").clicked() {
                         if let Err(error) = self.connect_playback(ctx) {
                             self.status = error;
                         }
                     }
-                    ui.small("Intelbras · H.264/H.265");
+                    ui.small(if hikvision {
+                        "Hikvision: informe os horários em UTC."
+                    } else {
+                        "Intelbras/Hikvision · H.264/H.265"
+                    });
                 },
             );
             ui.separator();
@@ -723,8 +793,8 @@ impl Viewer {
     fn connect_playback(&mut self, ctx: &egui::Context) -> Result<(), String> {
         let (index, channel) = self.playback_camera.ok_or("Selecione uma câmera.")?;
         let equipment = &self.equipment[index];
-        if equipment.brand != Brand::Intelbras {
-            return Err("Reprodução disponível apenas para Intelbras nesta versão.".into());
+        if equipment.brand == Brand::Custom {
+            return Err("Reprodução não disponível para este tipo de equipamento.".into());
         }
         let base = camera_url(
             equipment.brand,
@@ -735,7 +805,13 @@ impl Viewer {
             channel,
             true,
         )?;
-        let url = playback::url(base, channel, &self.playback_start, &self.playback_end)?;
+        let url = playback::url(
+            base,
+            equipment.brand,
+            channel,
+            &self.playback_start,
+            &self.playback_end,
+        )?;
         let password = credential(&equipment.id)
             .and_then(|entry| entry.get_password())
             .map_err(|_| "Não foi possível acessar a senha salva do equipamento.")?;
