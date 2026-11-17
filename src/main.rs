@@ -1,5 +1,6 @@
 use eframe::egui;
 mod discovery;
+mod export;
 mod playback;
 mod video;
 use serde::{Deserialize, Serialize};
@@ -135,6 +136,57 @@ fn camera_url(
     Ok(url)
 }
 
+#[derive(Clone, Copy)]
+struct ImageScale {
+    width: f32,
+    height: f32,
+}
+
+impl Default for ImageScale {
+    fn default() -> Self {
+        Self {
+            width: 1.0,
+            height: 1.0,
+        }
+    }
+}
+
+fn image_size(rect: egui::Rect, pixels: [usize; 2], scale: ImageScale) -> egui::Vec2 {
+    let aspect = pixels[0] as f32 / pixels[1] as f32;
+    let fitted = egui::vec2(
+        rect.width().min(rect.height() * aspect),
+        rect.height().min(rect.width() / aspect),
+    );
+    egui::vec2(fitted.x * scale.width, fitted.y * scale.height)
+}
+
+fn image_scale_menu(ui: &mut egui::Ui, slot: &mut VideoSlot, rect: egui::Rect) {
+    ui.menu_button("Redimensionar imagem", |ui| {
+        ui.label("Ajuste visual deste quadro");
+        ui.add(
+            egui::Slider::new(&mut slot.scale.width, 0.25..=4.0)
+                .text("Largura")
+                .custom_formatter(|n, _| format!("{:.0}%", n * 100.0)),
+        );
+        ui.add(
+            egui::Slider::new(&mut slot.scale.height, 0.25..=4.0)
+                .text("Altura")
+                .custom_formatter(|n, _| format!("{:.0}%", n * 100.0)),
+        );
+        if ui.button("Preencher quadro").clicked() {
+            if let Some(texture) = &slot.texture {
+                let fitted = image_size(rect, texture.size(), ImageScale::default());
+                slot.scale.width = (rect.width() / fitted.x).clamp(0.25, 4.0);
+                slot.scale.height = (rect.height() / fitted.y).clamp(0.25, 4.0);
+            }
+        }
+        if ui.button("Restaurar proporção original").clicked() {
+            slot.scale = ImageScale::default();
+        }
+        ui.small("Valores acima do quadro podem cortar a imagem.");
+    });
+}
+
 #[derive(Default)]
 struct VideoSlot {
     camera: Option<(String, u32)>,
@@ -143,6 +195,7 @@ struct VideoSlot {
     errors: Option<Receiver<&'static str>>,
     cancel: Option<tokio::sync::oneshot::Sender<()>>,
     texture: Option<egui::TextureHandle>,
+    scale: ImageScale,
 }
 
 impl VideoSlot {
@@ -296,6 +349,8 @@ struct Viewer {
     playback_camera: Option<(usize, u32)>,
     playback_start: String,
     playback_end: String,
+    export_result: Option<Receiver<(bool, &'static str)>>,
+    export_notice: Option<String>,
     equipment: Vec<Equipment>,
     load_failed: bool,
     selected: Option<usize>,
@@ -344,6 +399,8 @@ impl Default for Viewer {
             playback_camera: None,
             playback_start: String::new(),
             playback_end: String::new(),
+            export_result: None,
+            export_notice: None,
             equipment,
             load_failed,
             selected: None,
@@ -488,6 +545,18 @@ impl Viewer {
                             self.status = error;
                         }
                     }
+                    if ui
+                        .add_enabled(
+                            self.export_result.is_none(),
+                            egui::Button::new("Exportar intervalo…"),
+                        )
+                        .clicked()
+                    {
+                        if let Err(error) = self.start_export(ctx) {
+                            self.status = error;
+                        }
+                    }
+                    ui.small("Exporta vídeo em MKV, sem áudio.");
                     ui.small(if hikvision {
                         "Hikvision: informe os horários em UTC."
                     } else {
@@ -513,6 +582,8 @@ impl Viewer {
                                 self.playback_slot = index;
                             }
                             response.context_menu(|ui| {
+                                image_scale_menu(ui, &mut self.playback_slots[index], rect);
+                                ui.separator();
                                 if ui
                                     .add_enabled(
                                         self.playback_slots[index].camera.is_some(),
@@ -564,13 +635,12 @@ impl Viewer {
                                 egui::StrokeKind::Inside,
                             );
                             if let Some(texture) = &self.playback_slots[index].texture {
-                                let size = egui::vec2(rect.width(), rect.height()).min(egui::vec2(
-                                    rect.height() * texture.size()[0] as f32
-                                        / texture.size()[1] as f32,
-                                    rect.width() * texture.size()[1] as f32
-                                        / texture.size()[0] as f32,
-                                ));
-                                ui.painter().image(
+                                let size = image_size(
+                                    rect,
+                                    texture.size(),
+                                    self.playback_slots[index].scale,
+                                );
+                                ui.painter().with_clip_rect(rect).image(
                                     texture.id(),
                                     egui::Rect::from_center_size(rect.center(), size),
                                     egui::Rect::from_min_max(
@@ -832,6 +902,78 @@ impl Viewer {
         self.playback_slot = (self.playback_slot + 1) % self.playback_slots.len();
         Ok(())
     }
+
+    fn start_export(&mut self, ctx: &egui::Context) -> Result<(), String> {
+        let (index, channel) = self.playback_camera.ok_or("Selecione uma câmera.")?;
+        let equipment = self
+            .equipment
+            .get(index)
+            .ok_or("Equipamento indisponível.")?
+            .clone();
+        if equipment.brand == Brand::Custom {
+            return Err("Exportação não disponível para este tipo de equipamento.".into());
+        }
+        let base = camera_url(
+            equipment.brand,
+            &equipment.host,
+            equipment.port,
+            "",
+            "",
+            channel,
+            false,
+        )?;
+        let url = playback::url(
+            base,
+            equipment.brand,
+            channel,
+            &self.playback_start,
+            &self.playback_end,
+        )?;
+        let (tx, rx) = mpsc::channel();
+        let ctx = ctx.clone();
+        self.export_result = Some(rx);
+        self.status = "Escolha onde salvar a exportação…".into();
+        thread::spawn(move || {
+            let result = match rfd::FileDialog::new()
+                .set_title("Exportar vídeo")
+                .add_filter("Vídeo Matroska", &["mkv"])
+                .set_file_name("exportacao.mkv")
+                .save_file()
+            {
+                None => "Exportação cancelada.",
+                Some(path) => {
+                    match credential(&equipment.id).and_then(|entry| entry.get_password()) {
+                        Err(_) => "Senha indisponível no armazenamento seguro.",
+                        Ok(password) => {
+                            let _ = tx.send((
+                                false,
+                                "Exportando vídeo em segundo plano… mantenha o aplicativo aberto.",
+                            ));
+                            ctx.request_repaint();
+                            let credentials = retina::client::Credentials {
+                                username: equipment.username,
+                                password,
+                            };
+                            match tokio::runtime::Builder::new_current_thread()
+                                .enable_all()
+                                .build()
+                            {
+                                Ok(runtime) => {
+                                    match runtime.block_on(export::run(url, credentials, &path)) {
+                                        Ok(message) | Err(message) => message,
+                                    }
+                                }
+                                Err(_) => "Não foi possível iniciar a exportação.",
+                            }
+                        }
+                    }
+                }
+            };
+            let _ = tx.send((true, result));
+            ctx.request_repaint();
+        });
+        Ok(())
+    }
 }
 
 impl Drop for Viewer {
@@ -876,8 +1018,38 @@ fn update_slots(slots: &mut [VideoSlot], ctx: &egui::Context, status: &mut Strin
     }
 }
 
+fn poll_export(
+    receiver: &mut Option<Receiver<(bool, &'static str)>>,
+    status: &mut String,
+) -> Option<String> {
+    let rx = receiver.as_ref()?;
+    loop {
+        match rx.try_recv() {
+            Ok((false, message)) => *status = message.into(),
+            Ok((true, message)) => {
+                *status = message.into();
+                *receiver = None;
+                return Some(message.into());
+            }
+            Err(mpsc::TryRecvError::Empty) => return None,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                let message = "A exportação foi interrompida inesperadamente; o arquivo pode estar incompleto.";
+                *status = message.into();
+                *receiver = None;
+                return Some(message.into());
+            }
+        }
+    }
+}
+
 impl eframe::App for Viewer {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if let Some(message) = poll_export(&mut self.export_result, &mut self.status) {
+            self.export_notice = Some(message);
+        }
+        if self.export_result.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(500));
+        }
         if !self.discovery_started {
             self.discovery_started = true;
             for equipment in self.equipment.clone() {
@@ -1209,6 +1381,8 @@ impl eframe::App for Viewer {
                                         self.expanded_slot = toggle_expanded(expanded, index);
                                     }
                                     response.context_menu(|ui| {
+                                        image_scale_menu(ui, &mut self.slots[index], rect);
+                                        ui.separator();
                                         if ui
                                             .add_enabled(
                                                 self.slots[index].camera.is_some(),
@@ -1258,17 +1432,14 @@ impl eframe::App for Viewer {
                                     );
                                     if self.slots[index].camera.is_some() {
                                         if let Some(texture) = &self.slots[index].texture {
-                                            let size = egui::vec2(rect.width(), rect.height()).min(
-                                                egui::vec2(
-                                                    rect.height() * texture.size()[0] as f32
-                                                        / texture.size()[1] as f32,
-                                                    rect.width() * texture.size()[1] as f32
-                                                        / texture.size()[0] as f32,
-                                                ),
+                                            let size = image_size(
+                                                rect,
+                                                texture.size(),
+                                                self.slots[index].scale,
                                             );
                                             let image_rect =
                                                 egui::Rect::from_center_size(rect.center(), size);
-                                            ui.painter().image(
+                                            ui.painter().with_clip_rect(rect).image(
                                                 texture.id(),
                                                 image_rect,
                                                 egui::Rect::from_min_max(
@@ -1294,6 +1465,23 @@ impl eframe::App for Viewer {
                 });
             }
         });
+        if let Some(message) = self.export_notice.clone() {
+            let mut open = true;
+            let mut dismiss = false;
+            egui::Window::new("Resultado da exportação")
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    ui.label(message);
+                    if ui.button("OK").clicked() {
+                        dismiss = true;
+                    }
+                });
+            if dismiss || !open {
+                self.export_notice = None;
+            }
+        }
         if self.edit_open {
             let mut open = self.edit_open;
             egui::Window::new("Cadastro de equipamento")
@@ -1374,7 +1562,9 @@ impl eframe::App for Viewer {
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1000.0, 600.0]),
+        viewport: egui::ViewportBuilder::default()
+            .with_app_id("visor-dvr")
+            .with_inner_size([1000.0, 600.0]),
         ..Default::default()
     };
     eframe::run_native(
@@ -1387,6 +1577,68 @@ fn main() -> eframe::Result {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_scale_fits_and_adjusts_dimensions_independently() {
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+        assert_eq!(
+            image_size(rect, [1600, 900], ImageScale::default()),
+            egui::vec2(800.0, 450.0)
+        );
+        assert_eq!(
+            image_size(
+                rect,
+                [1600, 900],
+                ImageScale {
+                    width: 0.5,
+                    height: 2.0
+                }
+            ),
+            egui::vec2(400.0, 900.0)
+        );
+        assert_eq!(
+            image_size(rect, [900, 1600], ImageScale::default()),
+            egui::vec2(337.5, 600.0)
+        );
+    }
+
+    #[test]
+    fn export_completion_is_processed_even_when_progress_is_queued() {
+        let (tx, rx) = mpsc::channel();
+        let mut receiver = Some(rx);
+        let mut status = String::new();
+        tx.send((false, "Em andamento")).unwrap();
+        tx.send((true, "Exportação finalizada")).unwrap();
+        assert_eq!(
+            poll_export(&mut receiver, &mut status).as_deref(),
+            Some("Exportação finalizada")
+        );
+        assert!(receiver.is_none());
+        assert_eq!(status, "Exportação finalizada");
+    }
+
+    #[test]
+    fn export_interruption_releases_button_and_reports_problem() {
+        let (tx, rx) = mpsc::channel();
+        let mut receiver = Some(rx);
+        let mut status = String::new();
+        tx.send((false, "Em andamento")).unwrap();
+        drop(tx);
+        let notice = poll_export(&mut receiver, &mut status).unwrap();
+        assert!(notice.contains("interrompida"));
+        assert!(receiver.is_none());
+    }
+
+    #[test]
+    fn active_export_keeps_button_disabled() {
+        let (tx, rx) = mpsc::channel();
+        let mut receiver = Some(rx);
+        let mut status = String::new();
+        tx.send((false, "Em andamento")).unwrap();
+        assert!(poll_export(&mut receiver, &mut status).is_none());
+        assert!(receiver.is_some());
+        assert_eq!(status, "Em andamento");
+    }
 
     #[test]
     fn live_stream_quality_follows_grid_and_expansion() {

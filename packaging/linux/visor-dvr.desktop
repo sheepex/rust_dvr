@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Visor DVR
+Comment=Visualizador de câmeras DVR e NVR
+Exec=visor-dvr
+Icon=visor-dvr
+Terminal=false
+Categories=AudioVideo;Video;
+StartupWMClass=visor-dvr
