@@ -1,4 +1,8 @@
+#[path = "../config.rs"]
+#[allow(dead_code)]
+mod config;
 #[path = "../video.rs"]
+#[allow(dead_code)]
 mod video;
 use retina::client::Credentials;
 use serde::Deserialize;
@@ -13,21 +17,15 @@ struct Equipment {
 }
 
 fn main() {
-    let Some(path) = directories::ProjectDirs::from("br", "visor-dvr", "visor-dvr")
-        .map(|d| d.config_dir().join("equipamentos.json"))
-    else {
+    let Some(path) = config::path() else {
         eprintln!("Pasta de configuração indisponível.");
         return;
     };
-    let Ok(data) = std::fs::read(path) else {
-        eprintln!("Não foi possível ler o cadastro.");
-        return;
-    };
-    let Ok(items) = serde_json::from_slice::<Vec<Equipment>>(&data) else {
+    let Ok(config) = config::load::<Equipment>(&path) else {
         eprintln!("Cadastro inválido.");
         return;
     };
-    let Some(item) = items.first() else {
+    let Some(item) = config.equipment.first() else {
         eprintln!("Nenhum equipamento cadastrado.");
         return;
     };
@@ -56,7 +54,7 @@ fn main() {
             .enable_all()
             .build()
             .unwrap();
-        let result = runtime.block_on(video::run(url, creds, tx.clone(), None));
+        let result = runtime.block_on(video::run(url, creds, tx.clone(), None, None));
         if let Err(message) = result {
             let _ = tx.send(video::Event::Status(message));
         }
