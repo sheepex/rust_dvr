@@ -21,7 +21,7 @@ fn main() {
         eprintln!("Pasta de configuração indisponível.");
         return;
     };
-    let Ok(config) = config::load::<Equipment>(&path) else {
+    let Ok((config, _)) = config::load_local::<Equipment>(&path) else {
         eprintln!("Cadastro inválido.");
         return;
     };
@@ -29,11 +29,14 @@ fn main() {
         eprintln!("Nenhum equipamento cadastrado.");
         return;
     };
-    let Ok(entry) = keyring::Entry::new("br.visor-dvr.equipamentos", &item.id) else {
-        eprintln!("Armazenamento de credenciais indisponível.");
-        return;
+    let password = if let Some(passwords) = &config.passwords {
+        passwords
+            .get(&item.id)
+            .map(|password| password.as_str().to_owned())
+    } else {
+        config::legacy_password(&item.id).ok().flatten()
     };
-    let Ok(password) = entry.get_password() else {
+    let Some(password) = password else {
         eprintln!("Não foi possível obter a senha salva no gerenciador de credenciais.");
         return;
     };

@@ -20,6 +20,7 @@ futures = "0.3"
 rust_h264 = "0.6.1"
 rust_h265 = "0.4.1"
 aes = "0.8"
+zeroize = { version = "1", features = ["serde"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 digest_auth = "0.3"
 roxmltree = "0.20"

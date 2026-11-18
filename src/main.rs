@@ -5,12 +5,13 @@ mod export;
 mod playback;
 mod video;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::{
     sync::mpsc::{self, Receiver},
     thread,
 };
 use url::Url;
+use zeroize::Zeroizing;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
@@ -44,33 +45,150 @@ fn default_http_port() -> u16 {
     80
 }
 
-fn load_config() -> Result<config::Config<Vec<Equipment>>, String> {
+type LocalConfig = config::Config<Vec<Equipment>>;
+
+fn load_config() -> Result<LocalConfig, String> {
     let path = config::path().ok_or("Pasta de configuração indisponível.")?;
-    let mut config: config::Config<Vec<Equipment>> = config::load(&path)?;
-    let mut changed = false;
-    for item in &mut config.equipment {
-        if item.id.is_empty() {
-            item.id = uuid::Uuid::new_v4().to_string();
-            changed = true;
+    let (mut config, legacy) = config::load_local::<Equipment>(&path)?;
+    let import_passwords = config.passwords.is_none() && !config.equipment.is_empty();
+    if import_passwords {
+        let mut passwords = config::Passwords::new();
+        for item in &config.equipment {
+            if !item.id.is_empty() {
+                if let Some(password) = config::legacy_password(&item.id)? {
+                    passwords.insert(item.id.clone(), Zeroizing::new(password));
+                }
+            }
         }
+        config.passwords = Some(passwords);
     }
-    if changed {
+    let changed = assign_missing_equipment_ids(&mut config.equipment);
+    if legacy {
+        config::migrate(&path, &config)
+            .map_err(|_| "Não foi possível migrar equipamentos.json para configs.json.")?;
+    } else if changed || import_passwords {
         config::save(&path, &config)
             .map_err(|_| "Não foi possível atualizar o cadastro existente.")?;
     }
     Ok(config)
 }
 
-fn credential(id: &str) -> Result<keyring::Entry, keyring::Error> {
-    keyring::Entry::new("br.visor-dvr.equipamentos", id)
+fn assign_missing_equipment_ids(equipment: &mut [Equipment]) -> bool {
+    let mut changed = false;
+    for item in equipment {
+        if item.id.is_empty() {
+            item.id = uuid::Uuid::new_v4().to_string();
+            changed = true;
+        }
+    }
+    changed
 }
 
-fn save_config(equipment: &[Equipment], playback_cache_seconds: u16) -> Result<(), String> {
+fn validate_import(
+    mut imported: config::Config<Vec<Equipment>>,
+) -> Result<config::Config<Vec<Equipment>>, String> {
+    if !(config::MIN_CACHE_SECONDS..=config::MAX_CACHE_SECONDS)
+        .contains(&imported.playback_cache_seconds)
+    {
+        return Err("O tempo de cache do arquivo está fora do limite aceito.".into());
+    }
+    assign_missing_equipment_ids(&mut imported.equipment);
+    let mut ids = HashSet::new();
+    for (index, item) in imported.equipment.iter().enumerate() {
+        if !ids.insert(&item.id) {
+            return Err("O arquivo tem IDs de equipamentos duplicados.".into());
+        }
+        if item.name.trim().is_empty()
+            || item.channels == 0
+            || item.channels > 256
+            || item.port == 0
+            || item.http_port == 0
+            || camera_url(Brand::Intelbras, &item.host, item.port, "", "", 1, false).is_err()
+        {
+            return Err(format!(
+                "Os dados do equipamento {} estão inválidos.",
+                index + 1
+            ));
+        }
+    }
+    if let Some(passwords) = &mut imported.passwords {
+        passwords.retain(|id, _| ids.contains(id));
+    }
+    Ok(imported)
+}
+
+fn save_config(
+    equipment: &[Equipment],
+    playback_cache_seconds: u16,
+    passwords: &config::Passwords,
+) -> Result<(), String> {
     let path = config::path().ok_or("Pasta de configuração indisponível.")?;
+    save_config_at(&path, equipment, playback_cache_seconds, passwords)
+}
+
+fn save_config_at(
+    path: &std::path::Path,
+    equipment: &[Equipment],
+    playback_cache_seconds: u16,
+    passwords: &config::Passwords,
+) -> Result<(), String> {
     config::save(
-        &path,
-        &config::Config::new(equipment, playback_cache_seconds),
+        path,
+        &config_snapshot(equipment, playback_cache_seconds, passwords),
     )
+}
+
+fn config_snapshot<'a>(
+    equipment: &'a [Equipment],
+    playback_cache_seconds: u16,
+    passwords: &config::Passwords,
+) -> config::Config<&'a [Equipment]> {
+    let mut settings = config::Config::new(equipment, playback_cache_seconds);
+    settings.passwords = Some(passwords.clone());
+    settings
+}
+
+fn index_after_swap(index: usize, first: usize, second: usize) -> usize {
+    if index == first {
+        second
+    } else if index == second {
+        first
+    } else {
+        index
+    }
+}
+
+fn order_arrow(ui: &mut egui::Ui, enabled: bool, up: bool) -> egui::Response {
+    let label = if up {
+        "Mover equipamento para cima"
+    } else {
+        "Mover equipamento para baixo"
+    };
+    let (response, painter) = ui
+        .add_enabled_ui(enabled, |ui| {
+            ui.allocate_painter(
+                egui::vec2(22.0, ui.spacing().interact_size.y),
+                egui::Sense::click(),
+            )
+        })
+        .inner;
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, label));
+    let visuals = ui.style().interact(&response);
+    painter.rect(
+        response.rect,
+        visuals.corner_radius,
+        visuals.weak_bg_fill,
+        visuals.bg_stroke,
+        egui::StrokeKind::Inside,
+    );
+    let center = response.rect.center();
+    let dir = if up { -1.0 } else { 1.0 };
+    let stroke = egui::Stroke::new(1.5_f32, visuals.fg_stroke.color);
+    let tip = center + egui::vec2(0.0, dir * 4.5);
+    painter.line_segment([center - egui::vec2(0.0, dir * 4.5), tip], stroke);
+    painter.line_segment([center + egui::vec2(-4.0, 0.0), tip], stroke);
+    painter.line_segment([tip, center + egui::vec2(4.0, 0.0)], stroke);
+    response.on_hover_text(label)
 }
 
 fn camera_url(
@@ -593,9 +711,11 @@ struct Viewer {
     playback_speed: playback::Speed,
     playback_cache_seconds: u16,
     cache_draft: Option<u16>,
+    pending_config_import: Option<LocalConfig>,
     export_result: Option<Receiver<(bool, &'static str)>>,
     export_notice: Option<String>,
     equipment: Vec<Equipment>,
+    passwords: config::Passwords,
     load_failed: bool,
     selected: Option<usize>,
     name: String,
@@ -618,19 +738,18 @@ struct Viewer {
 
 impl Default for Viewer {
     fn default() -> Self {
-        let (config, status, load_failed) = match load_config() {
-            Ok(config) => (
+        match load_config() {
+            Ok(config) => Self::new(
                 config,
                 "Cadastre ou selecione um equipamento.".into(),
                 false,
             ),
-            Err(error) => (
+            Err(error) => Self::new(
                 config::Config::new(Vec::new(), config::DEFAULT_CACHE_SECONDS),
                 error,
                 true,
             ),
-        };
-        Self::new(config, status, load_failed)
+        }
     }
 }
 
@@ -663,9 +782,11 @@ impl Viewer {
             playback_speed: playback::Speed::default(),
             playback_cache_seconds: config.playback_cache_seconds,
             cache_draft: None,
+            pending_config_import: None,
             export_result: None,
             export_notice: None,
             equipment: config.equipment,
+            passwords: config.passwords.unwrap_or_default(),
             load_failed,
             selected: None,
             name: String::new(),
@@ -689,6 +810,104 @@ impl Viewer {
 }
 
 impl Viewer {
+    fn equipment_password(&self, id: &str) -> Option<String> {
+        self.passwords
+            .get(id)
+            .map(|password| password.as_str().to_owned())
+    }
+
+    fn prepare_import(&mut self, path: std::path::PathBuf) -> Result<(), String> {
+        self.pending_config_import = Some(validate_import(config::read_import(&path)?)?);
+        Ok(())
+    }
+
+    fn apply_config_import(
+        &mut self,
+        path: &std::path::Path,
+        mut settings: LocalConfig,
+    ) -> Result<(), String> {
+        let passwords = settings.passwords.take().unwrap_or_default();
+        config::backup_current(path)?;
+        save_config_at(
+            path,
+            &settings.equipment,
+            settings.playback_cache_seconds,
+            &passwords,
+        )?;
+
+        self.stop();
+        for slot in &mut self.playback_slots {
+            slot.stop();
+        }
+        self.playback_cameras.fill(None);
+        self.playback_group = None;
+        self.playback_intelbras_offset.clear();
+        self.playback_expanded_slot = None;
+        self.expanded_slot = None;
+        self.selected = None;
+        self.edit_open = false;
+        self.password.clear();
+        self.equipment = settings.equipment;
+        self.passwords = passwords;
+        self.playback_cache_seconds = settings.playback_cache_seconds;
+        self.load_failed = false;
+        self.cache_draft = Some(self.playback_cache_seconds);
+        // Imported addresses are not contacted just by importing the configuration.
+        self.discovery_started = true;
+        self.discovery = self
+            .equipment
+            .iter()
+            .map(|item| {
+                (
+                    item.id.clone(),
+                    (0, discovery::State::Unknown("Verificação pendente.")),
+                )
+            })
+            .collect();
+        Ok(())
+    }
+
+    fn backup_ui(&mut self, ctx: &egui::Context) {
+        if let Some(imported) = self.pending_config_import.take() {
+            let mut open = true;
+            let mut confirm = false;
+            let mut cancel = false;
+            egui::Window::new("Confirmar importação")
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    ui.label(format!(
+                        "O arquivo contém {} equipamento(s) e {} senha(s).",
+                        imported.equipment.len(),
+                        imported
+                            .passwords
+                            .as_ref()
+                            .map_or(0, |passwords| passwords.len())
+                    ));
+                    ui.label("Substituir a configuração atual e fechar as câmeras abertas?");
+                    ui.small("O aplicativo guarda uma cópia local da configuração anterior.");
+                    ui.horizontal(|ui| {
+                        confirm = ui.button("Substituir configuração").clicked();
+                        cancel = ui.button("Cancelar").clicked();
+                    });
+                });
+            if confirm && open && !cancel {
+                let result = config::path()
+                    .ok_or_else(|| "Pasta de configuração indisponível.".to_owned())
+                    .and_then(|path| self.apply_config_import(&path, imported));
+                self.status = match result {
+                    Ok(()) => {
+                        "Configuração importada. A lista de equipamentos foi atualizada.".into()
+                    }
+                    Err(error) => error,
+                };
+            } else if open && !cancel {
+                self.pending_config_import = Some(imported);
+            }
+        }
+    }
+
     fn start_discovery(&mut self, equipment: Equipment, ctx: &egui::Context) {
         self.next_discovery += 1;
         let generation = self.next_discovery;
@@ -698,10 +917,11 @@ impl Viewer {
         );
         let sender = self.discovery_tx.clone();
         let ctx = ctx.clone();
+        let password = self.equipment_password(&equipment.id);
         thread::spawn(move || {
-            let state = match credential(&equipment.id).and_then(|entry| entry.get_password()) {
-                Ok(password) => discovery::discover(&equipment, password),
-                Err(_) => discovery::State::Unknown("Senha indisponível no armazenamento seguro."),
+            let state = match password {
+                Some(password) => discovery::discover(&equipment, password),
+                None => discovery::State::Unknown("Senha não cadastrada."),
             };
             let _ = sender.send((equipment.id, generation, state));
             ctx.request_repaint();
@@ -778,7 +998,7 @@ impl Viewer {
                         .show(ui, |ui| {
                             for (index, item) in self.equipment.iter().enumerate() {
                                 egui::CollapsingHeader::new(self.device_title(item))
-                                    .id_salt(("playback_equipment", index))
+                                    .id_salt(("playback_equipment", &item.id))
                                     .show(ui, |ui| {
                                         for camera in self.cameras_for(item) {
                                             let channel = camera.channel;
@@ -1053,13 +1273,17 @@ impl Viewer {
             username: self.username.clone(),
             channels: self.channel_count,
         };
+        let mut passwords = self.passwords.clone();
+        if !self.password.is_empty() {
+            passwords.insert(equipment.id.clone(), Zeroizing::new(self.password.clone()));
+        }
         let mut updated = self.equipment.clone();
         if let Some(index) = self.selected {
             updated[index] = equipment;
         } else {
             updated.push(equipment);
         }
-        match save_config(&updated, self.playback_cache_seconds) {
+        match save_config(&updated, self.playback_cache_seconds, &passwords) {
             Ok(()) => {
                 self.selected = Some(if self.selected.is_some() {
                     self.selected.unwrap()
@@ -1067,18 +1291,42 @@ impl Viewer {
                     updated.len() - 1
                 });
                 self.equipment = updated;
-                if !self.password.is_empty() {
-                    let id = &self.equipment[self.selected.unwrap()].id;
-                    self.status = match credential(id).and_then(|entry| entry.set_password(&self.password)) {
-                        Ok(()) => "Equipamento salvo com a senha no armazenamento seguro do sistema.".into(),
-                        Err(_) => "Equipamento salvo, mas não foi possível salvar a senha no armazenamento seguro do sistema.".into(),
-                    };
-                } else {
-                    self.status = "Equipamento salvo. Nenhuma nova senha foi informada.".into();
-                }
+                self.passwords = passwords;
+                self.status = "Equipamento salvo.".into();
             }
             Err(error) => self.status = error,
         }
+    }
+
+    fn swap_equipment(
+        &mut self,
+        first: usize,
+        second: usize,
+        save: impl FnOnce(&[Equipment], u16, &config::Passwords) -> Result<(), String>,
+    ) -> Result<(), String> {
+        if self.load_failed {
+            return Err("Cadastro não carregado; a ordem não pode ser alterada.".into());
+        }
+        let mut updated = self.equipment.clone();
+        updated.swap(first, second);
+        save(&updated, self.playback_cache_seconds, &self.passwords)?;
+        self.equipment = updated;
+
+        // Playback and the edit form store list indices, while live sessions and
+        // credentials already use stable equipment IDs.
+        if let Some(index) = &mut self.selected {
+            *index = index_after_swap(*index, first, second);
+        }
+        fn remap(cameras: &mut PlaybackCameras, first: usize, second: usize) {
+            for (index, _) in cameras.iter_mut().flatten() {
+                *index = index_after_swap(*index, first, second);
+            }
+        }
+        remap(&mut self.playback_cameras, first, second);
+        if let Some(group) = &mut self.playback_group {
+            remap(&mut group.cameras, first, second);
+        }
+        Ok(())
     }
 
     fn select(&mut self, index: usize) {
@@ -1090,14 +1338,7 @@ impl Viewer {
         self.http_port = equipment.http_port;
         self.username = equipment.username.clone();
         self.channel_count = equipment.channels;
-        self.password = match credential(&equipment.id).and_then(|entry| entry.get_password()) {
-            Ok(password) => password,
-            Err(keyring::Error::NoEntry) => String::new(),
-            Err(_) => {
-                self.status = "Não foi possível acessar a senha salva. Confira o armazenamento de credenciais do sistema.".into();
-                String::new()
-            }
-        };
+        self.password = self.equipment_password(&equipment.id).unwrap_or_default();
         self.selected = Some(index);
         self.channel = 1;
     }
@@ -1179,11 +1420,11 @@ impl Viewer {
                 *channel,
                 desired,
             )?;
-            let password = match credential(id).and_then(|entry| entry.get_password()) {
-                Ok(password) => password,
-                Err(keyring::Error::NoEntry) => String::new(),
-                Err(_) => return Err("Não foi possível acessar a senha para ajustar o fluxo."),
-            };
+            let password = self
+                .passwords
+                .get(id)
+                .map(|password| password.as_str().to_owned())
+                .unwrap_or_default();
             let credentials = retina::client::Credentials {
                 username: equipment.username.clone(),
                 password,
@@ -1376,7 +1617,11 @@ impl Viewer {
                         requested_utc,
                         prefill_seconds,
                     };
-                    start_recording(slot, equipment, channel, request, ctx)
+                    let password = self
+                        .passwords
+                        .get(&equipment.id)
+                        .ok_or("Senha não cadastrada.")?;
+                    start_recording(slot, equipment, channel, request, password, ctx)
                 });
             match result {
                 Ok(()) => opened += 1,
@@ -1474,6 +1719,9 @@ impl Viewer {
             interval = interval.shifted(self.intelbras_offset(true)?.unwrap_or(0))?;
         }
         let url = interval.url_at(base, equipment.brand, channel, 0)?;
+        let password = self
+            .equipment_password(&equipment.id)
+            .ok_or("Senha não cadastrada.")?;
         let (tx, rx) = mpsc::channel();
         let ctx = ctx.clone();
         self.export_result = Some(rx);
@@ -1487,30 +1735,25 @@ impl Viewer {
             {
                 None => "Exportação cancelada.",
                 Some(path) => {
-                    match credential(&equipment.id).and_then(|entry| entry.get_password()) {
-                        Err(_) => "Senha indisponível no armazenamento seguro.",
-                        Ok(password) => {
-                            let _ = tx.send((
-                                false,
-                                "Exportando vídeo em segundo plano… mantenha o aplicativo aberto.",
-                            ));
-                            ctx.request_repaint();
-                            let credentials = retina::client::Credentials {
-                                username: equipment.username,
-                                password,
-                            };
-                            match tokio::runtime::Builder::new_current_thread()
-                                .enable_all()
-                                .build()
-                            {
-                                Ok(runtime) => {
-                                    match runtime.block_on(export::run(url, credentials, &path)) {
-                                        Ok(message) | Err(message) => message,
-                                    }
-                                }
-                                Err(_) => "Não foi possível iniciar a exportação.",
+                    let _ = tx.send((
+                        false,
+                        "Exportando vídeo em segundo plano… mantenha o aplicativo aberto.",
+                    ));
+                    ctx.request_repaint();
+                    let credentials = retina::client::Credentials {
+                        username: equipment.username,
+                        password,
+                    };
+                    match tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                    {
+                        Ok(runtime) => {
+                            match runtime.block_on(export::run(url, credentials, &path)) {
+                                Ok(message) | Err(message) => message,
                             }
                         }
+                        Err(_) => "Não foi possível iniciar a exportação.",
                     }
                 }
             };
@@ -1535,6 +1778,7 @@ fn start_recording(
     equipment: &Equipment,
     channel: u32,
     request: PlaybackRequest,
+    password: &str,
     ctx: &egui::Context,
 ) -> Result<(), &'static str> {
     let progress = request.progress;
@@ -1553,14 +1797,11 @@ fn start_recording(
     let url = progress
         .interval
         .url_at(base, equipment.brand, channel, progress.offset())?;
-    let password = credential(&equipment.id)
-        .and_then(|entry| entry.get_password())
-        .map_err(|_| "Não foi possível acessar a senha salva do equipamento.")?;
     slot.start(
         url,
         retina::client::Credentials {
             username: equipment.username.clone(),
-            password,
+            password: password.to_owned(),
         },
         (equipment.id.clone(), channel),
         ctx,
@@ -2008,6 +2249,7 @@ impl eframe::App for Viewer {
                 });
                 ui.separator();
                 let mut edit = None;
+                let mut reorder = None;
                 egui::ScrollArea::both().show(ui, |ui| {
                     egui::Grid::new("equipment_table")
                         .striped(true)
@@ -2018,6 +2260,7 @@ impl eframe::App for Viewer {
                             ui.strong("Marca");
                             ui.strong("Porta RTSP");
                             ui.strong("Canais");
+                            ui.strong("Ordem");
                             ui.strong("Ação");
                             ui.end_row();
                             for (index, equipment) in self.equipment.iter().enumerate() {
@@ -2033,6 +2276,24 @@ impl eframe::App for Viewer {
                                 let count = self.cameras_for(equipment).len();
                                 ui.label(count.to_string())
                                     .on_hover_text(self.device_status(equipment));
+                                ui.push_id(&equipment.id, |ui| {
+                                    ui.horizontal(|ui| {
+                                        if order_arrow(ui, !self.load_failed && index > 0, true)
+                                            .clicked()
+                                        {
+                                            reorder = Some((index, index - 1));
+                                        }
+                                        if order_arrow(
+                                            ui,
+                                            !self.load_failed && index + 1 < self.equipment.len(),
+                                            false,
+                                        )
+                                        .clicked()
+                                        {
+                                            reorder = Some((index, index + 1));
+                                        }
+                                    });
+                                });
                                 if ui.button("Editar").clicked() {
                                     edit = Some(index);
                                 }
@@ -2043,6 +2304,12 @@ impl eframe::App for Viewer {
                 if let Some(index) = edit {
                     self.select(index);
                     self.edit_open = true;
+                }
+                if let Some((first, second)) = reorder {
+                    self.status = match self.swap_equipment(first, second, save_config) {
+                        Ok(()) => "Ordem dos equipamentos salva.".into(),
+                        Err(error) => error,
+                    };
                 }
             } else if self.tab == Tab::Playback {
                 self.playback_ui(ui, ctx);
@@ -2072,7 +2339,7 @@ impl eframe::App for Viewer {
                                 .show(ui, |ui| {
                                     for (index, item) in self.equipment.iter().enumerate() {
                                         egui::CollapsingHeader::new(self.device_title(item))
-                                            .id_salt(("camera_tree", index))
+                                            .id_salt(("camera_tree", &item.id))
                                             .show(ui, |ui| {
                                                 ui.small(self.device_status(item));
                                                 for camera in self.cameras_for(item) {
@@ -2274,6 +2541,9 @@ impl eframe::App for Viewer {
             let mut open = true;
             let mut save = false;
             let mut cancel = false;
+            let mut export_config = false;
+            let mut import_config = false;
+            let backup_busy = self.pending_config_import.is_some();
             egui::Window::new("Configuração")
                 .open(&mut open)
                 .collapsible(false)
@@ -2297,9 +2567,15 @@ impl eframe::App for Viewer {
                         save = ui.add_enabled(!self.load_failed, egui::Button::new("Salvar")).clicked();
                         cancel = ui.button("Cancelar").clicked();
                     });
+                    ui.separator();
+                    ui.small("O arquivo inclui as senhas sem criptografia. Guarde-o em local privado.");
+                    ui.horizontal(|ui| {
+                        export_config = ui.add_enabled(!self.load_failed && !backup_busy, egui::Button::new("Exportar configurações…")).clicked();
+                        import_config = ui.add_enabled(!backup_busy, egui::Button::new("Importar configurações…")).clicked();
+                    });
                 });
             if save {
-                match save_config(&self.equipment, seconds) {
+                match save_config(&self.equipment, seconds, &self.passwords) {
                     Ok(()) => {
                         self.playback_cache_seconds = seconds;
                         self.status = format!("Cache da reprodução salvo: {seconds} s por câmera.");
@@ -2309,7 +2585,36 @@ impl eframe::App for Viewer {
                 }
             }
             self.cache_draft = (open && !cancel).then_some(seconds);
+            if export_config {
+                if let Some(file) = rfd::FileDialog::new()
+                    .set_title("Exportar configurações salvas")
+                    .add_filter("Arquivo JSON", &["json"])
+                    .set_file_name(config::FILE_NAME)
+                    .save_file()
+                {
+                    let snapshot = config_snapshot(
+                        &self.equipment,
+                        self.playback_cache_seconds,
+                        &self.passwords,
+                    );
+                    self.status = match config::export(&file, &snapshot) {
+                        Ok(()) => "Configurações exportadas.".into(),
+                        Err(error) => error,
+                    };
+                }
+            } else if import_config {
+                if let Some(path) = rfd::FileDialog::new()
+                    .set_title("Importar configurações")
+                    .add_filter("Arquivo JSON", &["json"])
+                    .pick_file()
+                {
+                    if let Err(error) = self.prepare_import(path) {
+                        self.status = error;
+                    }
+                }
+            }
         }
+        self.backup_ui(ctx);
         if let Some(message) = self.export_notice.clone() {
             let mut open = true;
             let mut dismiss = false;
@@ -2378,15 +2683,11 @@ impl eframe::App for Viewer {
                             ui.add(egui::DragValue::new(&mut self.channel_count).range(1..=256));
                             ui.end_row();
                         });
-                    ui.label(
-                        "A senha é salva no armazenamento de credenciais do sistema, não no JSON.",
-                    );
+                    ui.label("A senha é salva em configs.json, sem criptografia.");
                     ui.label("RTSP geralmente usa a porta 554, não a porta de serviço 37777.");
                     if ui.button("Salvar").clicked() {
                         self.save();
-                        if !self.status.contains("não foi possível salvar a senha")
-                            && self.status.starts_with("Equipamento salvo")
-                        {
+                        if self.status.starts_with("Equipamento salvo") {
                             self.edit_open = false;
                             if let Some(index) = self.selected {
                                 self.start_discovery(self.equipment[index].clone(), ctx);
@@ -2406,6 +2707,28 @@ impl eframe::App for Viewer {
 }
 
 fn main() -> eframe::Result {
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == "--migrar-config")
+    {
+        match load_config() {
+            Ok(settings) => {
+                println!(
+                    "Configuração verificada: {} equipamento(s), {} senha(s).",
+                    settings.equipment.len(),
+                    settings
+                        .passwords
+                        .as_ref()
+                        .map_or(0, |passwords| passwords.len())
+                );
+                return Ok(());
+            }
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        }
+    }
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_app_id("visor-dvr")
@@ -2527,6 +2850,58 @@ mod tests {
             String::new(),
             false,
         )
+    }
+
+    #[test]
+    fn reordering_equipment_preserves_current_selections_and_streams() {
+        let mut viewer = playback_test_viewer();
+        viewer.equipment = ["first", "second", "third"]
+            .map(|id| Equipment {
+                id: id.into(),
+                name: id.into(),
+                brand: Brand::Intelbras,
+                host: "example.com".into(),
+                port: 554,
+                http_port: 80,
+                username: "viewer".into(),
+                channels: 4,
+            })
+            .into();
+        viewer.selected = Some(1);
+        viewer.playback_cameras[..3].copy_from_slice(&[Some((0, 1)), Some((1, 2)), Some((2, 3))]);
+        let (mut group, slots) = playback_test_group(std::time::Instant::now());
+        group.cameras = viewer.playback_cameras;
+        viewer.playback_group = Some(group);
+        viewer.playback_slots = slots;
+        let (cancel, mut worker) = tokio::sync::oneshot::channel();
+        viewer.playback_slots[0].cancel = Some(cancel);
+        viewer.slots[0].camera = Some(("first".into(), 1));
+        viewer.playback_cache_seconds = 12;
+        viewer
+            .swap_equipment(0, 1, |equipment, cache, _| {
+                assert_eq!(
+                    equipment.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
+                    ["second", "first", "third"]
+                );
+                assert_eq!(cache, 12);
+                Ok(())
+            })
+            .unwrap();
+        let expected = [Some((1, 1)), Some((0, 2)), Some((2, 3))];
+        assert_eq!(viewer.selected, Some(0));
+        assert_eq!(viewer.playback_cameras[..3], expected);
+        assert_eq!(viewer.playback_group.unwrap().cameras[..3], expected);
+        assert_eq!(viewer.slots[0].camera, Some(("first".into(), 1)));
+        assert!(matches!(
+            worker.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+
+        let failed = viewer.swap_equipment(0, 1, |_, _, _| Err("Falha na gravação.".into()));
+        assert!(failed.is_err());
+        assert_eq!(viewer.equipment[0].id, "second");
+        assert_eq!(viewer.selected, Some(0));
+        assert_eq!(viewer.playback_group.unwrap().cameras[..3], expected);
     }
 
     #[test]
@@ -3100,20 +3475,82 @@ mod tests {
     }
 
     #[test]
+    fn exported_configuration_restores_passwords_order_and_cache_on_another_installation() {
+        let dir = std::env::temp_dir().join(format!("visor-dvr-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join(config::FILE_NAME);
+        let old = br#"{"playback_cache_seconds":7,"equipment":[],"passwords":{}}"#;
+        std::fs::write(&path, old).unwrap();
+        let settings: LocalConfig = config::parse(br#"{
+            "playback_cache_seconds": 15,
+            "equipment": [
+                {"id":"b","name":"B","brand":"Intelbras","host":"b.example","port":554,"username":"viewer","channels":4},
+                {"id":"a","name":"A","brand":"Hikvision","host":"a.example","port":554,"username":"viewer","channels":4}
+            ],
+            "passwords":{"a":"synthetic-a","b":"synthetic-b"}
+        }"#).unwrap();
+        let exported = dir.join("backup.json");
+        let snapshot = config_snapshot(
+            &settings.equipment,
+            settings.playback_cache_seconds,
+            &settings.passwords.unwrap(),
+        );
+        config::export(&exported, &snapshot).unwrap();
+        let mut viewer = playback_test_viewer();
+        viewer.prepare_import(exported.clone()).unwrap();
+        assert!(viewer.equipment.is_empty());
+        let pending = viewer.pending_config_import.take().unwrap();
+        viewer.apply_config_import(&path, pending).unwrap();
+        assert_eq!(viewer.playback_cache_seconds, 15);
+        assert_eq!(
+            viewer
+                .equipment
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            ["b", "a"]
+        );
+        assert_eq!(
+            viewer.equipment_password("b").as_deref(),
+            Some("synthetic-b")
+        );
+        assert!(viewer.discovery_started);
+        let reloaded = config::read_import::<Equipment>(&path).unwrap();
+        assert_eq!(reloaded.passwords, snapshot.passwords);
+        let copied = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .find(|entry| entry.file_name().to_string_lossy().ends_with(".bak.json"))
+            .unwrap();
+        assert_eq!(std::fs::read(copied.path()).unwrap(), old);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for file in [&path, &exported, &copied.path()] {
+                assert_eq!(
+                    std::fs::metadata(file).unwrap().permissions().mode() & 0o777,
+                    0o600
+                );
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn saving_cache_preserves_old_equipment_and_its_keyring_id() {
         let dir = std::env::temp_dir().join(format!("visor-dvr-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&dir).unwrap();
         let path = dir.join("equipamentos.json");
         let legacy = br#"[{"id":"existing-id","name":"Teste","brand":"Intelbras","host":"example.com","port":554,"username":"viewer","channels":4,"password":"not-serialized"}]"#;
         std::fs::write(&path, legacy).unwrap();
-        let loaded = config::load::<Equipment>(&path).unwrap();
+        let loaded = config::read_import::<Equipment>(&path).unwrap();
         assert_eq!(loaded.playback_cache_seconds, 7);
         assert_eq!(std::fs::read(&path).unwrap(), legacy);
 
         config::save(&path, &config::Config::new(&loaded.equipment, 18)).unwrap();
         let saved = std::fs::read_to_string(&path).unwrap();
         assert!(!saved.contains("password"));
-        let reloaded = config::load::<Equipment>(&path).unwrap();
+        let reloaded = config::read_import::<Equipment>(&path).unwrap();
         assert_eq!(reloaded.playback_cache_seconds, 18);
         assert_eq!(reloaded.equipment.len(), 1);
         assert_eq!(reloaded.equipment[0].id, "existing-id");
