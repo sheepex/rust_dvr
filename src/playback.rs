@@ -80,6 +80,7 @@ const FORM: &str = "%Y-%m-%d %H:%M:%S";
 pub struct OpeningTimes {
     local: Interval,
     utc: Interval,
+    #[cfg(test)]
     offset_minutes: Option<i32>,
 }
 
@@ -101,7 +102,9 @@ impl OpeningTimes {
                     .to_zoned(end.time_zone().clone())
                     .expect("data local imediatamente anterior")
             });
+        #[cfg(test)]
         let offset = end.offset().seconds();
+        #[cfg(test)]
         let offset_minutes =
             (start.offset() == end.offset() && offset % 60 == 0 && offset.abs() <= 14 * 3600)
                 .then_some(offset / 60);
@@ -114,6 +117,7 @@ impl OpeningTimes {
                 start: start.timestamp().to_zoned(TimeZone::UTC).datetime(),
                 end: end.timestamp().to_zoned(TimeZone::UTC).datetime(),
             },
+            #[cfg(test)]
             offset_minutes,
         }
     }
@@ -123,6 +127,7 @@ impl OpeningTimes {
         [interval.start, interval.end].map(|time| time.strftime(FORM).to_string())
     }
 
+    #[cfg(test)]
     pub fn offset_field(&self) -> Option<String> {
         let minutes = self.offset_minutes?;
         let sign = if minutes < 0 { '-' } else { '+' };
@@ -159,6 +164,23 @@ pub struct Interval {
 }
 
 impl Interval {
+    pub fn local_to_utc(self, zone: &TimeZone) -> Result<Self, &'static str> {
+        let convert = |time| {
+            zone.to_ambiguous_zoned(time)
+                .disambiguate(jiff::tz::Disambiguation::Reject)
+                .map(|zoned| zoned.timestamp().to_zoned(TimeZone::UTC).datetime())
+                .map_err(|_| "Horário local ambíguo ou inexistente no fuso do computador.")
+        };
+        let converted = Self {
+            start: convert(self.start)?,
+            end: convert(self.end)?,
+        };
+        if converted.seconds() != self.seconds() {
+            return Err("O intervalo atravessa uma mudança de fuso; escolha um intervalo menor.");
+        }
+        Ok(converted)
+    }
+
     pub fn new(start: &str, end: &str) -> Result<Self, &'static str> {
         let start = parse_datetime(start)?;
         let end = parse_datetime(end)?;
@@ -229,7 +251,7 @@ pub fn utc_offset_minutes(input: &str) -> Result<i64, &'static str> {
         }
         _ => {}
     }
-    Err("Informe o fuso dos Intelbras em relação a UTC (ex.: -03:00).")
+    Err("Informe o fuso entre -14:00 e +14:00 (ex.: -03:00).")
 }
 
 pub const FRAME_STALL: Duration = Duration::from_secs(4);
@@ -394,7 +416,7 @@ fn url_for_times(
                 .append_pair("starttime", &start.strftime("%Y%m%dT%H%M%SZ").to_string())
                 .append_pair("endtime", &end.strftime("%Y%m%dT%H%M%SZ").to_string());
         }
-        crate::Brand::Custom => {
+        crate::Brand::Custom | crate::Brand::Onvif => {
             return Err("Reprodução não disponível para este tipo de equipamento.")
         }
     }
@@ -404,6 +426,20 @@ fn url_for_times(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn converts_onvif_local_time_using_computer_timezone() {
+        let zone = TimeZone::get("America/Sao_Paulo").unwrap();
+        let local = Interval::new("2026-11-19 08:22:00", "2026-11-19 08:23:00").unwrap();
+        let utc = local.local_to_utc(&zone).unwrap();
+        assert_eq!(utc.at(0).to_string(), "2026-11-19T11:22:00");
+        assert_eq!(utc.seconds(), 60);
+        let zone = TimeZone::get("America/New_York").unwrap();
+        let ambiguous = Interval::new("2026-11-01 01:30:00", "2026-11-01 02:30:00").unwrap();
+        assert!(ambiguous.local_to_utc(&zone).is_err());
+        let crossing = Interval::new("2026-11-01 00:30:00", "2026-11-01 02:30:00").unwrap();
+        assert!(crossing.local_to_utc(&zone).is_err());
+    }
 
     #[test]
     fn opening_defaults_use_local_date_and_convert_both_endpoints_to_utc() {

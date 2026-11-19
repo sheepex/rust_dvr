@@ -2,6 +2,7 @@ use eframe::egui;
 mod config;
 mod discovery;
 mod export;
+mod onvif;
 mod playback;
 mod video;
 use serde::{Deserialize, Serialize};
@@ -24,6 +25,8 @@ enum Tab {
 enum Brand {
     Intelbras,
     Hikvision,
+    #[serde(alias = "Ezviz")]
+    Onvif,
     Custom,
 }
 
@@ -37,12 +40,33 @@ struct Equipment {
     port: u16,
     #[serde(default = "default_http_port")]
     http_port: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    utc_offset_minutes: Option<i64>,
     username: String,
     channels: u32,
 }
 
 fn default_http_port() -> u16 {
     80
+}
+
+fn format_utc_offset(minutes: i64) -> String {
+    let sign = if minutes < 0 { '-' } else { '+' };
+    let value = minutes.abs();
+    format!("{sign}{:02}:{:02}", value / 60, value % 60)
+}
+
+fn device_playback_interval(
+    brand: Brand,
+    offset: Option<i64>,
+    local: playback::Interval,
+    utc: playback::Interval,
+) -> Result<playback::Interval, &'static str> {
+    match (brand, offset) {
+        (Brand::Intelbras, Some(minutes)) => utc.shifted(minutes),
+        (Brand::Intelbras, None) => Ok(local),
+        _ => Ok(utc),
+    }
 }
 
 type LocalConfig = config::Config<Vec<Equipment>>;
@@ -103,6 +127,9 @@ fn validate_import(
             || item.channels > 256
             || item.port == 0
             || item.http_port == 0
+            || item
+                .utc_offset_minutes
+                .is_some_and(|offset| !(-840..=840).contains(&offset))
             || camera_url(Brand::Intelbras, &item.host, item.port, "", "", 1, false).is_err()
         {
             return Err(format!(
@@ -112,7 +139,12 @@ fn validate_import(
         }
     }
     if let Some(passwords) = &mut imported.passwords {
-        passwords.retain(|id, _| ids.contains(id));
+        passwords.retain(|id, _| {
+            ids.contains(id)
+                || id
+                    .strip_suffix(":video")
+                    .is_some_and(|id| ids.iter().any(|known| known.as_str() == id))
+        });
     }
     Ok(imported)
 }
@@ -232,9 +264,33 @@ fn camera_url(
                 if secondary { 2 } else { 1 }
             ));
         }
+        Brand::Onvif => {
+            url.set_path("/ch1/main");
+        }
         Brand::Custom => return Err("Informe uma URL RTSP personalizada."),
     }
     Ok(url)
+}
+
+fn onvif_device_url(rtsp: &Url, http_port: u16) -> Result<Url, &'static str> {
+    let rest = rtsp
+        .as_str()
+        .strip_prefix("rtsp:")
+        .ok_or("Endereço ONVIF inválido.")?;
+    // URL's scheme setter cannot switch a non-special RTSP URL to special HTTP.
+    let mut device = Url::parse(&format!("http:{rest}")).map_err(|_| "Endereço ONVIF inválido.")?;
+    device
+        .set_port(Some(http_port))
+        .map_err(|_| "Porta ONVIF inválida.")?;
+    device.set_path("/onvif/device_service");
+    device.set_query(None);
+    device
+        .set_username("")
+        .map_err(|_| "Endereço ONVIF inválido.")?;
+    device
+        .set_password(None)
+        .map_err(|_| "Endereço ONVIF inválido.")?;
+    Ok(device)
 }
 
 #[derive(Clone, Copy)]
@@ -486,6 +542,19 @@ impl VideoSlot {
             requested_utc: request.requested_utc,
             buffer: Default::default(),
             prefill_seconds: request.prefill_seconds,
+            onvif_range: if url.scheme() == "http" {
+                request.requested_utc.map(|start| {
+                    let remaining = request.progress.interval.seconds() - request.progress.offset();
+                    let end = start + jiff::SignedDuration::from_secs(remaining);
+                    format!(
+                        "clock={}-{}",
+                        start.strftime("%Y%m%dT%H%M%SZ"),
+                        end.strftime("%Y%m%dT%H%M%SZ")
+                    )
+                })
+            } else {
+                None
+            },
         });
         self.playback_buffer = playback_options
             .as_ref()
@@ -512,7 +581,18 @@ impl VideoSlot {
                     let result = tokio::select! {
                         biased;
                         _ = &mut cancel_rx => break,
-                        result = video::run(url.clone(), credentials.clone(), sender.clone(), Some(ctx.clone()), playback_options.clone()) => result,
+                        result = async {
+                            let stream = if url.scheme() == "http" {
+                                if playback_options.is_some() {
+                                    onvif::replay_url(&url, &credentials).await?
+                                } else {
+                                    onvif::stream_url(&url, &credentials).await?
+                                }
+                            } else {
+                                url.clone()
+                            };
+                            video::run(stream, credentials.clone(), sender.clone(), Some(ctx.clone()), playback_options.clone(), url.scheme() == "http").await
+                        } => result,
                     };
                     let error = match result {
                         Ok(()) => break,
@@ -680,8 +760,6 @@ type VideoSlots = [VideoSlot; MAX_GRID_SLOTS];
 struct PlaybackGroup {
     cameras: PlaybackCameras,
     interval: playback::Interval,
-    utc: bool,
-    intelbras_offset: Option<i64>,
     clock: playback::SyncClock,
 }
 
@@ -703,15 +781,13 @@ struct Viewer {
     window_size: Option<egui::Vec2>,
     playback_cameras: PlaybackCameras,
     playback_group: Option<PlaybackGroup>,
-    playback_intelbras_offset: String,
     playback_start: String,
     playback_end: String,
-    playback_opening_times: Option<playback::OpeningTimes>,
-    playback_default_brands: (bool, bool),
     playback_speed: playback::Speed,
     playback_cache_seconds: u16,
     cache_draft: Option<u16>,
     pending_config_import: Option<LocalConfig>,
+    pending_equipment_removal: Option<String>,
     export_result: Option<Receiver<(bool, &'static str)>>,
     export_notice: Option<String>,
     equipment: Vec<Equipment>,
@@ -734,6 +810,7 @@ struct Viewer {
     discovery_started: bool,
     next_discovery: u64,
     http_port: u16,
+    equipment_utc_offset: String,
 }
 
 impl Default for Viewer {
@@ -774,15 +851,13 @@ impl Viewer {
             window_size: None,
             playback_cameras: [None; MAX_GRID_SLOTS],
             playback_group: None,
-            playback_intelbras_offset: String::new(),
             playback_start: String::new(),
             playback_end: String::new(),
-            playback_opening_times: None,
-            playback_default_brands: (false, false),
             playback_speed: playback::Speed::default(),
             playback_cache_seconds: config.playback_cache_seconds,
             cache_draft: None,
             pending_config_import: None,
+            pending_equipment_removal: None,
             export_result: None,
             export_notice: None,
             equipment: config.equipment,
@@ -805,6 +880,7 @@ impl Viewer {
             discovery_started: false,
             next_discovery: 0,
             http_port: 80,
+            equipment_utc_offset: String::new(),
         }
     }
 }
@@ -841,10 +917,10 @@ impl Viewer {
         }
         self.playback_cameras.fill(None);
         self.playback_group = None;
-        self.playback_intelbras_offset.clear();
         self.playback_expanded_slot = None;
         self.expanded_slot = None;
         self.selected = None;
+        self.pending_equipment_removal = None;
         self.edit_open = false;
         self.password.clear();
         self.equipment = settings.equipment;
@@ -1020,36 +1096,10 @@ impl Viewer {
                         self.assign_playback_camera(camera);
                     }
                     ui.separator();
-                    let brands @ (hikvision, intelbras) = self.playback_brands();
-                    self.refresh_playback_default_zone(brands);
-                    ui.label(if hikvision {
-                        "Início (UTC)"
-                    } else {
-                        "Início (hora do DVR)"
-                    });
+                    ui.label("Início (hora local do computador)");
                     datetime_field(ui, &mut self.playback_start);
-                    ui.label(if hikvision {
-                        "Fim (UTC)"
-                    } else {
-                        "Fim (hora do DVR)"
-                    });
+                    ui.label("Fim (hora local do computador)");
                     datetime_field(ui, &mut self.playback_end);
-                    if intelbras {
-                        let label = ui.label(if hikvision {
-                            "Fuso Intelbras em relação a UTC"
-                        } else {
-                            "Fuso dos DVRs (opcional)"
-                        });
-                        if hikvision {
-                            label.on_hover_text(
-                                "Confirme o fuso se o DVR for diferente do computador.",
-                            );
-                        }
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.playback_intelbras_offset)
-                                .hint_text("-03:00"),
-                        );
-                    }
                     let previous_speed = self.playback_speed;
                     ui.horizontal(|ui| {
                         ui.label("Velocidade");
@@ -1220,7 +1270,7 @@ impl Viewer {
             ui.label("Linha do tempo do grupo · Inicie a reprodução.");
             return;
         };
-        let zone = if group.utc { "UTC" } else { "hora dos DVRs" };
+        let zone = "hora local do computador";
         let current =
             (group.clock.position(std::time::Instant::now()) as i64).min(group.interval.seconds());
         if let Some(offset) = playback_timeline_control(ui, group.interval, zone, current) {
@@ -1248,6 +1298,17 @@ impl Viewer {
             self.status = "Informe um nome para o equipamento.".into();
             return;
         }
+        let utc_offset_minutes = if self.equipment_utc_offset.trim().is_empty() {
+            None
+        } else {
+            match playback::utc_offset_minutes(&self.equipment_utc_offset) {
+                Ok(offset) => Some(offset),
+                Err(error) => {
+                    self.status = error.into();
+                    return;
+                }
+            }
+        };
         if let Err(error) = camera_url(
             self.brand,
             &self.host,
@@ -1270,8 +1331,13 @@ impl Viewer {
             host: self.host.clone(),
             port: self.port,
             http_port: self.http_port,
+            utc_offset_minutes,
             username: self.username.clone(),
-            channels: self.channel_count,
+            channels: if self.brand == Brand::Onvif {
+                1
+            } else {
+                self.channel_count
+            },
         };
         let mut passwords = self.passwords.clone();
         if !self.password.is_empty() {
@@ -1329,6 +1395,100 @@ impl Viewer {
         Ok(())
     }
 
+    fn remove_equipment(
+        &mut self,
+        id: &str,
+        save: impl FnOnce(&[Equipment], u16, &config::Passwords) -> Result<(), String>,
+    ) -> Result<(), String> {
+        if self.load_failed {
+            return Err("Cadastro não carregado; a remoção está bloqueada.".into());
+        }
+        let index = self
+            .equipment
+            .iter()
+            .position(|item| item.id == id)
+            .ok_or("Equipamento não encontrado.")?;
+        let mut updated = self.equipment.clone();
+        updated.remove(index);
+        let mut passwords = self.passwords.clone();
+        passwords.remove(id);
+        passwords.remove(&format!("{id}:video"));
+        save(&updated, self.playback_cache_seconds, &passwords)?;
+
+        for slot in self.slots.iter_mut().chain(self.playback_slots.iter_mut()) {
+            if slot
+                .camera
+                .as_ref()
+                .is_some_and(|(camera_id, _)| camera_id == id)
+            {
+                slot.stop();
+            }
+        }
+        fn remap(cameras: &mut PlaybackCameras, removed: usize) {
+            for camera in cameras {
+                if let Some((index, _)) = camera {
+                    if *index == removed {
+                        *camera = None;
+                    } else if *index > removed {
+                        *index -= 1;
+                    }
+                }
+            }
+        }
+        remap(&mut self.playback_cameras, index);
+        if let Some(group) = &mut self.playback_group {
+            remap(&mut group.cameras, index);
+            if group.cameras.iter().all(Option::is_none) {
+                self.playback_group = None;
+            }
+        }
+        if let Some(selected) = self.selected {
+            if selected == index {
+                self.selected = None;
+                self.edit_open = false;
+                self.password.clear();
+            } else if selected > index {
+                self.selected = Some(selected - 1);
+            }
+        }
+        self.discovery.remove(id);
+        self.equipment = updated;
+        self.passwords = passwords;
+        Ok(())
+    }
+
+    fn equipment_removal_ui(&mut self, ctx: &egui::Context) {
+        let Some(id) = self.pending_equipment_removal.take() else {
+            return;
+        };
+        let Some(equipment) = self.equipment.iter().find(|item| item.id == id) else {
+            return;
+        };
+        let mut open = true;
+        let mut confirm = false;
+        let mut cancel = false;
+        egui::Window::new("Confirmar remoção")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.label(format!("Remover o equipamento \"{}\"?", equipment.name));
+                ui.label("O cadastro e suas senhas serão removidos; câmeras abertas deste equipamento serão fechadas.");
+                ui.horizontal(|ui| {
+                    confirm = ui.button("Remover equipamento").clicked();
+                    cancel = ui.button("Cancelar").clicked();
+                });
+            });
+        if confirm && open && !cancel {
+            self.status = match self.remove_equipment(&id, save_config) {
+                Ok(()) => "Equipamento removido.".into(),
+                Err(error) => error,
+            };
+        } else if open && !cancel {
+            self.pending_equipment_removal = Some(id);
+        }
+    }
+
     fn select(&mut self, index: usize) {
         let equipment = &self.equipment[index];
         self.name = equipment.name.clone();
@@ -1336,6 +1496,10 @@ impl Viewer {
         self.host = equipment.host.clone();
         self.port = equipment.port;
         self.http_port = equipment.http_port;
+        self.equipment_utc_offset = equipment
+            .utc_offset_minutes
+            .map(format_utc_offset)
+            .unwrap_or_default();
         self.username = equipment.username.clone();
         self.channel_count = equipment.channels;
         self.password = self.equipment_password(&equipment.id).unwrap_or_default();
@@ -1370,6 +1534,9 @@ impl Viewer {
             )?
         };
         let mut url = url;
+        if self.brand == Brand::Onvif {
+            url = onvif_device_url(&url, self.http_port)?;
+        }
         let credentials = retina::client::Credentials {
             username: self.username.clone(),
             password: self.password.clone(),
@@ -1385,7 +1552,7 @@ impl Viewer {
             None,
         );
         self.slots[self.selected_slot].secondary =
-            (self.brand != Brand::Custom).then_some(secondary);
+            (!matches!(self.brand, Brand::Custom | Brand::Onvif)).then_some(secondary);
         self.status = "Conectando…".into();
         if self.expanded_slot.is_none() {
             self.selected_slot = next_slot(self.selected_slot, self.grid_side);
@@ -1447,63 +1614,13 @@ impl Viewer {
         }
     }
 
-    fn playback_brands(&self) -> (bool, bool) {
-        let cameras = self.visible_playback_cameras();
-        let brands = || {
-            cameras.iter().flatten().filter_map(|(index, _)| {
-                self.equipment.get(*index).map(|equipment| equipment.brand)
-            })
-        };
-        (
-            brands().any(|brand| brand == Brand::Hikvision),
-            brands().any(|brand| brand == Brand::Intelbras),
-        )
-    }
-
     fn open_playback_tab(&mut self, now: impl FnOnce() -> jiff::Zoned) {
         if !self.playback_tab_open {
-            let brands = self.playback_brands();
             let times = playback::OpeningTimes::new(now());
             [self.playback_start, self.playback_end] = times.fields(false);
-            self.playback_opening_times = Some(times);
-            self.playback_default_brands = (false, false);
-            self.refresh_playback_default_zone(brands);
             self.playback_tab_open = true;
         }
         self.tab = Tab::Playback;
-    }
-
-    fn refresh_playback_default_zone(&mut self, brands: (bool, bool)) {
-        let previous = self.playback_default_brands;
-        let Some(times) = &self.playback_opening_times else {
-            return;
-        };
-        if brands.0 != previous.0 {
-            let [old_start, old_end] = times.fields(previous.0);
-            let [new_start, new_end] = times.fields(brands.0);
-            if self.playback_start == old_start {
-                self.playback_start = new_start;
-            }
-            if self.playback_end == old_end {
-                self.playback_end = new_end;
-            }
-        }
-        if brands == (true, true)
-            && previous != brands
-            && self.playback_intelbras_offset.trim().is_empty()
-        {
-            if let Some(offset) = times.offset_field() {
-                self.playback_intelbras_offset = offset;
-            }
-        }
-        self.playback_default_brands = brands;
-    }
-
-    fn intelbras_offset(&self, required: bool) -> Result<Option<i64>, &'static str> {
-        if !required && self.playback_intelbras_offset.trim().is_empty() {
-            return Ok(None);
-        }
-        playback::utc_offset_minutes(&self.playback_intelbras_offset).map(Some)
     }
 
     fn connect_playback(&mut self, ctx: &egui::Context) -> Result<(), &'static str> {
@@ -1512,17 +1629,10 @@ impl Viewer {
             return Err("Escolha uma câmera em pelo menos um quadro.");
         }
         let interval = playback::Interval::new(&self.playback_start, &self.playback_end)?;
-        let (utc, intelbras) = self.playback_brands();
-        let intelbras_offset = if intelbras {
-            self.intelbras_offset(utc)?
-        } else {
-            None
-        };
+        interval.local_to_utc(&jiff::tz::TimeZone::system())?;
         let group = PlaybackGroup {
             cameras,
             interval,
-            utc,
-            intelbras_offset,
             clock: playback::SyncClock::new(
                 0,
                 self.playback_speed,
@@ -1576,20 +1686,8 @@ impl Viewer {
         let offset = group.interval.seek_offset(offset);
         let prefill_seconds = playback::Progress::new(group.interval, offset, self.playback_speed)
             .prefill_seconds(self.playback_cache_seconds);
-        let intelbras_interval = group.interval.shifted(if group.utc {
-            group.intelbras_offset.unwrap_or(0)
-        } else {
-            0
-        })?;
-        let utc_interval = if group.utc {
-            Some(group.interval)
-        } else {
-            group
-                .intelbras_offset
-                .map(|minutes| group.interval.shifted(-minutes))
-                .transpose()?
-        };
-        let requested_utc = utc_interval.map(|interval| interval.at(offset));
+        let utc_interval = group.interval.local_to_utc(&jiff::tz::TimeZone::system())?;
+        let requested_utc = Some(utc_interval.at(offset));
         let mut opened = 0;
         let mut failures = 0;
         for (slot, camera) in self.playback_slots.iter_mut().zip(group.cameras) {
@@ -1606,11 +1704,12 @@ impl Viewer {
             let result = equipment
                 .ok_or("Equipamento indisponível.")
                 .and_then(|equipment| {
-                    let interval = if equipment.brand == Brand::Intelbras {
-                        intelbras_interval
-                    } else {
-                        group.interval
-                    };
+                    let interval = device_playback_interval(
+                        equipment.brand,
+                        equipment.utc_offset_minutes,
+                        group.interval,
+                        utc_interval,
+                    )?;
                     let progress = playback::Progress::new(interval, offset, self.playback_speed);
                     let request = PlaybackRequest {
                         progress,
@@ -1702,7 +1801,7 @@ impl Viewer {
             .get(index)
             .ok_or("Equipamento indisponível.")?
             .clone();
-        if equipment.brand == Brand::Custom {
+        if matches!(equipment.brand, Brand::Custom | Brand::Onvif) {
             return Err("Exportação não disponível para este tipo de equipamento.".into());
         }
         let base = camera_url(
@@ -1714,10 +1813,10 @@ impl Viewer {
             channel,
             false,
         )?;
-        let mut interval = playback::Interval::new(&self.playback_start, &self.playback_end)?;
-        if equipment.brand == Brand::Intelbras && self.playback_brands().0 {
-            interval = interval.shifted(self.intelbras_offset(true)?.unwrap_or(0))?;
-        }
+        let local = playback::Interval::new(&self.playback_start, &self.playback_end)?;
+        let utc = local.local_to_utc(&jiff::tz::TimeZone::system())?;
+        let interval =
+            device_playback_interval(equipment.brand, equipment.utc_offset_minutes, local, utc)?;
         let url = interval.url_at(base, equipment.brand, channel, 0)?;
         let password = self
             .equipment_password(&equipment.id)
@@ -1794,9 +1893,13 @@ fn start_recording(
         channel,
         true,
     )?;
-    let url = progress
-        .interval
-        .url_at(base, equipment.brand, channel, progress.offset())?;
+    let url = if equipment.brand == Brand::Onvif {
+        onvif_device_url(&base, equipment.http_port)?
+    } else {
+        progress
+            .interval
+            .url_at(base, equipment.brand, channel, progress.offset())?
+    };
     slot.start(
         url,
         retina::client::Credentials {
@@ -2227,6 +2330,7 @@ impl eframe::App for Viewer {
                         self.brand = Brand::Intelbras;
                         self.port = 554;
                         self.http_port = 80;
+                        self.equipment_utc_offset.clear();
                         self.channel_count = 4;
                         self.edit_open = true;
                     }
@@ -2250,6 +2354,7 @@ impl eframe::App for Viewer {
                 ui.separator();
                 let mut edit = None;
                 let mut reorder = None;
+                let mut remove = None;
                 egui::ScrollArea::both().show(ui, |ui| {
                     egui::Grid::new("equipment_table")
                         .striped(true)
@@ -2270,9 +2375,14 @@ impl eframe::App for Viewer {
                                 ui.label(match equipment.brand {
                                     Brand::Intelbras => "Intelbras",
                                     Brand::Hikvision => "Hikvision",
+                                    Brand::Onvif => "ONVIF",
                                     Brand::Custom => "Personalizado",
                                 });
-                                ui.label(equipment.port.to_string());
+                                ui.label(if equipment.brand == Brand::Onvif {
+                                    "Automática".to_owned()
+                                } else {
+                                    equipment.port.to_string()
+                                });
                                 let count = self.cameras_for(equipment).len();
                                 ui.label(count.to_string())
                                     .on_hover_text(self.device_status(equipment));
@@ -2294,9 +2404,20 @@ impl eframe::App for Viewer {
                                         }
                                     });
                                 });
-                                if ui.button("Editar").clicked() {
-                                    edit = Some(index);
-                                }
+                                ui.horizontal(|ui| {
+                                    if ui.button("Editar").clicked() {
+                                        edit = Some(index);
+                                    }
+                                    if ui
+                                        .add_enabled(
+                                            !self.load_failed,
+                                            egui::Button::new("Remover"),
+                                        )
+                                        .clicked()
+                                    {
+                                        remove = Some(equipment.id.clone());
+                                    }
+                                });
                                 ui.end_row();
                             }
                         });
@@ -2304,6 +2425,9 @@ impl eframe::App for Viewer {
                 if let Some(index) = edit {
                     self.select(index);
                     self.edit_open = true;
+                }
+                if let Some(id) = remove {
+                    self.pending_equipment_removal = Some(id);
                 }
                 if let Some((first, second)) = reorder {
                     self.status = match self.swap_equipment(first, second, save_config) {
@@ -2615,6 +2739,7 @@ impl eframe::App for Viewer {
             }
         }
         self.backup_ui(ctx);
+        self.equipment_removal_ui(ctx);
         if let Some(message) = self.export_notice.clone() {
             let mut open = true;
             let mut dismiss = false;
@@ -2649,6 +2774,7 @@ impl eframe::App for Viewer {
                                 .selected_text(match self.brand {
                                     Brand::Intelbras => "Intelbras",
                                     Brand::Hikvision => "Hikvision",
+                                    Brand::Onvif => "ONVIF",
                                     Brand::Custom => "Personalizado",
                                 })
                                 .show_ui(ui, |ui| {
@@ -2662,16 +2788,29 @@ impl eframe::App for Viewer {
                                         Brand::Hikvision,
                                         "Hikvision",
                                     );
+                                    if ui.selectable_value(&mut self.brand, Brand::Onvif, "ONVIF").clicked() {
+                                        self.channel_count = 1;
+                                        if self.username.is_empty() {
+                                            self.username = "admin".into();
+                                        }
+                                    }
                                 });
                             ui.end_row();
                             ui.label("IP / domínio");
                             ui.text_edit_singleline(&mut self.host);
                             ui.end_row();
                             ui.label("Porta RTSP");
-                            ui.add(egui::DragValue::new(&mut self.port).range(1..=u16::MAX));
+                            if self.brand == Brand::Onvif {
+                                ui.label("Informada pelo dispositivo");
+                            } else {
+                                ui.add(egui::DragValue::new(&mut self.port).range(1..=u16::MAX));
+                            }
                             ui.end_row();
                             ui.label("Porta HTTP");
                             ui.add(egui::DragValue::new(&mut self.http_port).range(1..=u16::MAX));
+                            ui.end_row();
+                            ui.label("Fuso do equipamento (UTC)");
+                            ui.add(egui::TextEdit::singleline(&mut self.equipment_utc_offset).hint_text("Automático (computador)"));
                             ui.end_row();
                             ui.label("Usuário");
                             ui.text_edit_singleline(&mut self.username);
@@ -2680,10 +2819,18 @@ impl eframe::App for Viewer {
                             ui.add(egui::TextEdit::singleline(&mut self.password).password(true));
                             ui.end_row();
                             ui.label("Quantidade de canais");
-                            ui.add(egui::DragValue::new(&mut self.channel_count).range(1..=256));
+                            if self.brand == Brand::Onvif {
+                                ui.label("1 (primeiro perfil ONVIF)");
+                            } else {
+                                ui.add(egui::DragValue::new(&mut self.channel_count).range(1..=256));
+                            }
                             ui.end_row();
                         });
                     ui.label("A senha é salva em configs.json, sem criptografia.");
+                    ui.small("Fuso: deixe vazio para usar o fuso do computador ou informe um deslocamento fixo, como -03:00. Usado na reprodução Intelbras; Hikvision e ONVIF usam UTC no protocolo. Não altera o relógio do equipamento.");
+                    if self.brand == Brand::Onvif {
+                        ui.label("ONVIF: a porta HTTP é usada para consultar o primeiro perfil e o endereço RTSP. Reprodução experimental.");
+                    }
                     ui.label("RTSP geralmente usa a porta 554, não a porta de serviço 37777.");
                     if ui.button("Salvar").clicked() {
                         self.save();
@@ -2832,8 +2979,6 @@ mod tests {
         let group = PlaybackGroup {
             cameras,
             interval,
-            utc: true,
-            intelbras_offset: None,
             clock: playback::SyncClock::new(0, speed, 7.0, now),
         };
         let mut slots: VideoSlots = Default::default();
@@ -2853,6 +2998,103 @@ mod tests {
     }
 
     #[test]
+    fn playback_uses_local_input_and_individual_device_offsets() {
+        let zone = jiff::tz::TimeZone::get("America/Sao_Paulo").unwrap();
+        let local = playback::Interval::new("2026-11-19 08:22:00", "2026-11-19 08:23:00").unwrap();
+        let utc = local.local_to_utc(&zone).unwrap();
+        assert_eq!(
+            device_playback_interval(Brand::Intelbras, None, local, utc)
+                .unwrap()
+                .at(0)
+                .to_string(),
+            "2026-11-19T08:22:00"
+        );
+        assert_eq!(
+            device_playback_interval(Brand::Intelbras, Some(-240), local, utc)
+                .unwrap()
+                .at(0)
+                .to_string(),
+            "2026-11-19T07:22:00"
+        );
+        assert_eq!(
+            device_playback_interval(Brand::Hikvision, Some(-240), local, utc)
+                .unwrap()
+                .at(0)
+                .to_string(),
+            "2026-11-19T11:22:00"
+        );
+        assert_eq!(
+            device_playback_interval(Brand::Onvif, Some(-240), local, utc)
+                .unwrap()
+                .at(0)
+                .to_string(),
+            "2026-11-19T11:22:00"
+        );
+        assert_eq!(format_utc_offset(-210), "-03:30");
+        assert!(playback::utc_offset_minutes("+14:01").is_err());
+    }
+
+    #[test]
+    fn removing_equipment_saves_first_and_preserves_other_selections() {
+        let mut viewer = playback_test_viewer();
+        viewer.equipment = ["first", "second", "third"]
+            .map(|id| Equipment {
+                id: id.into(),
+                name: id.into(),
+                brand: Brand::Intelbras,
+                host: "example.com".into(),
+                port: 554,
+                http_port: 80,
+                utc_offset_minutes: None,
+                username: "viewer".into(),
+                channels: 4,
+            })
+            .into();
+        for id in ["second", "second:video", "third"] {
+            viewer
+                .passwords
+                .insert(id.into(), Zeroizing::new("secret".into()));
+        }
+        viewer.selected = Some(2);
+        viewer.playback_cameras[..3].copy_from_slice(&[Some((0, 1)), Some((1, 2)), Some((2, 3))]);
+        let (mut group, _) = playback_test_group(std::time::Instant::now());
+        group.cameras = viewer.playback_cameras;
+        viewer.playback_group = Some(group);
+        viewer.slots[0].camera = Some(("second".into(), 1));
+        viewer.slots[1].camera = Some(("third".into(), 1));
+        viewer.playback_slots[1].camera = Some(("second".into(), 2));
+        assert!(viewer
+            .remove_equipment("second", |_, _, _| Err("erro".into()))
+            .is_err());
+        assert_eq!(viewer.equipment.len(), 3);
+        assert!(viewer.slots[0].camera.is_some());
+        assert!(viewer.passwords.contains_key("second"));
+        viewer
+            .remove_equipment("second", |equipment, _, passwords| {
+                assert_eq!(
+                    equipment.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
+                    ["first", "third"]
+                );
+                assert!(!passwords.contains_key("second"));
+                assert!(!passwords.contains_key("second:video"));
+                assert!(passwords.contains_key("third"));
+                Ok(())
+            })
+            .unwrap();
+        let expected = [Some((0, 1)), None, Some((1, 3))];
+        assert_eq!(viewer.playback_cameras[..3], expected);
+        assert_eq!(viewer.playback_group.unwrap().cameras[..3], expected);
+        assert_eq!(viewer.selected, Some(1));
+        assert!(viewer.slots[0].camera.is_none());
+        assert!(viewer.playback_slots[1].camera.is_none());
+        assert_eq!(viewer.slots[1].camera.as_ref().unwrap().0, "third");
+        viewer.load_failed = true;
+        assert!(viewer
+            .remove_equipment("third", |_, _, _| panic!("não deve salvar"))
+            .is_err());
+    }
+
+    #[test]
     fn reordering_equipment_preserves_current_selections_and_streams() {
         let mut viewer = playback_test_viewer();
         viewer.equipment = ["first", "second", "third"]
@@ -2863,6 +3105,7 @@ mod tests {
                 host: "example.com".into(),
                 port: 554,
                 http_port: 80,
+                utc_offset_minutes: None,
                 username: "viewer".into(),
                 channels: 4,
             })
@@ -2905,24 +3148,18 @@ mod tests {
     }
 
     #[test]
-    fn opening_playback_populates_dates_once_and_keeps_manual_edits_when_zones_change() {
+    fn opening_playback_populates_local_dates_once_and_keeps_manual_edits() {
         let mut viewer = playback_test_viewer();
         viewer.open_playback_tab(|| "2024-03-01T12:15:43-03:00[-03:00]".parse().unwrap());
         assert_eq!(viewer.playback_start, "2024-03-01 07:30:00");
         assert_eq!(viewer.playback_end, "2024-03-01 12:15:43");
 
         viewer.playback_start = "2024-03-01 11:00:00".into();
-        viewer.refresh_playback_default_zone((true, true));
         assert_eq!(viewer.playback_start, "2024-03-01 11:00:00");
-        assert_eq!(viewer.playback_end, "2024-03-01 15:15:43");
-        assert_eq!(viewer.playback_intelbras_offset, "-03:00");
-        viewer.playback_intelbras_offset = "-02:00".into();
-        viewer.refresh_playback_default_zone((false, true));
-        viewer.refresh_playback_default_zone((true, true));
-        assert_eq!(viewer.playback_intelbras_offset, "-02:00");
+        assert_eq!(viewer.playback_end, "2024-03-01 12:15:43");
 
         viewer.open_playback_tab(|| panic!("a aba já está aberta"));
-        assert_eq!(viewer.playback_end, "2024-03-01 15:15:43");
+        assert_eq!(viewer.playback_end, "2024-03-01 12:15:43");
         viewer.playback_tab_open = false;
         viewer.open_playback_tab(|| "2024-03-02T12:17:00-03:00[-03:00]".parse().unwrap());
         assert_eq!(viewer.playback_start, "2024-03-02 07:30:00");
@@ -3472,6 +3709,43 @@ mod tests {
     fn rejects_invalid_host_and_channel() {
         assert!(camera_url(Brand::Intelbras, "host/path", 554, "", "", 1, false).is_err());
         assert!(camera_url(Brand::Intelbras, "host", 554, "", "", 0, false).is_err());
+    }
+
+    #[test]
+    fn onvif_click_builds_http_device_url_without_credentials() {
+        let rtsp = camera_url(Brand::Onvif, "192.0.2.1", 554, "admin", "secret", 1, false).unwrap();
+        let device = onvif_device_url(&rtsp, 8080).unwrap();
+        assert_eq!(
+            device.as_str(),
+            "http://192.0.2.1:8080/onvif/device_service"
+        );
+        assert!(device.username().is_empty());
+        assert!(device.password().is_none());
+        let ipv6 = camera_url(Brand::Onvif, "::1", 554, "", "", 1, false).unwrap();
+        assert_eq!(
+            onvif_device_url(&ipv6, 80).unwrap().as_str(),
+            "http://[::1]/onvif/device_service"
+        );
+    }
+
+    #[test]
+    fn imports_legacy_ezviz_as_onvif_without_losing_credentials() {
+        let settings: LocalConfig = config::parse(br#"{
+            "equipment":[{"id":"camera","name":"EZ","brand":"Ezviz","host":"camera.local","port":554,"username":"admin","channels":1}],
+            "passwords":{"camera":"access","camera:video":"video","other:video":"orphan"}
+        }"#).unwrap();
+        let validated = validate_import(settings).unwrap();
+        let passwords = validated.passwords.unwrap();
+        assert_eq!(
+            passwords.get("camera:video").map(|p| p.as_str()),
+            Some("video")
+        );
+        assert!(!passwords.contains_key("other:video"));
+        assert!(validated.equipment[0].brand == Brand::Onvif);
+        assert_eq!(
+            serde_json::to_string(&validated.equipment[0].brand).unwrap(),
+            "\"Onvif\""
+        );
     }
 
     #[test]

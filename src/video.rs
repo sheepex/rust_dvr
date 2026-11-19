@@ -309,6 +309,16 @@ fn receive_error(codec: &str, detail: &str) -> &'static str {
     if codec == "h265" && detail.contains("sps_max_sub_layers_minus1 must be in [0, 6]") {
         "Parâmetros H.265 inválidos. O fluxo pode estar criptografado ou ser incompatível."
     } else if detail.starts_with("wrong ssrc ") {
+        #[cfg(test)]
+        if std::env::var_os("ONVIF_TEST_RTP_DIAGNOSTIC").is_some() {
+            eprintln!(
+                "Diagnóstico RTP: {}.",
+                detail
+                    .split("; expecting")
+                    .next()
+                    .unwrap_or("identificador inconsistente")
+            );
+        }
         "Erro de identificador RTP (R1) durante a reprodução ou transmissão."
     } else if detail.starts_with("Out-of-order packet or large loss") {
         if detail.contains("seq=Some(Seq { init: PlayResponseHeader") {
@@ -415,6 +425,7 @@ pub struct PlaybackOptions {
     pub requested_utc: Option<jiff::civil::DateTime>,
     pub buffer: Arc<PlaybackBuffer>,
     pub prefill_seconds: f64,
+    pub onvif_range: Option<String>,
 }
 
 struct PlaybackTiming {
@@ -547,6 +558,7 @@ pub async fn run(
     frames: SyncSender<Event>,
     ctx: Option<eframe::egui::Context>,
     playback: Option<PlaybackOptions>,
+    onvif: bool,
 ) -> Result<(), &'static str> {
     let hik_key = credentials.password.clone();
     let path = url.path().to_ascii_lowercase();
@@ -572,17 +584,28 @@ pub async fn run(
     let codec = session.streams()[index]
         .encoding_name()
         .to_ascii_lowercase();
+    #[cfg(test)]
+    if onvif && playback.is_some() {
+        eprintln!("Diagnóstico de reprodução: codec {codec}.");
+    }
     if codec != "h264" && codec != "h265" {
         return Err("Codec não suportado: use H.264 ou H.265.");
     }
     tokio::time::timeout(
         Duration::from_secs(12),
-        session.setup(index, SetupOptions::default()),
+        session.setup(
+            index,
+            SetupOptions::default().onvif_replay(
+                playback
+                    .as_ref()
+                    .is_some_and(|options| options.onvif_range.is_some()),
+            ),
+        ),
     )
     .await
     .map_err(|_| "Tempo esgotado ao preparar o vídeo.")?
     .map_err(|error| request_error(error.status_code(), "Falha ao preparar o vídeo RTSP."))?;
-    let play_options = if is_hik_playback(&path) {
+    let play_options = if onvif || is_hik_playback(&path) {
         // Some recorders report an initial sequence unrelated to the first RTP packet.
         // Keep Retina's normal validation once the stream has started.
         PlayOptions::default().initial_seq(InitialSequenceNumberPolicy::Ignore)
@@ -592,9 +615,35 @@ pub async fn run(
     let (session, playback_timing) = tokio::time::timeout(Duration::from_secs(12), async {
         if let Some(playback) = playback {
             let scale = playback.rate;
-            let (session, reported_scale, range) = session
-                .play_with_timing(play_options, (scale != 1.0).then_some(scale))
-                .await?;
+            let scale_request = (scale != 1.0).then_some(scale);
+            let (session, reported_scale, range) = if let Some(range) = &playback.onvif_range {
+                session
+                    .play_with_timing_range(play_options, scale_request, range)
+                    .await?
+            } else {
+                session
+                    .play_with_timing(play_options, scale_request)
+                    .await?
+            };
+            #[cfg(test)]
+            if playback.onvif_range.is_some() {
+                eprintln!(
+                    "Diagnóstico: servidor respondeu com Range: {}.",
+                    range.is_some()
+                );
+            }
+            if playback.onvif_range.is_some() && range.is_none() {
+                if frames
+                    .try_send(Event::Status(
+                        "A câmera não confirmou o horário da gravação; confira as imagens.",
+                    ))
+                    .is_ok()
+                {
+                    if let Some(ctx) = &ctx {
+                        ctx.request_repaint();
+                    }
+                }
+            }
             let notice = match (scale != 1.0, reported_scale) {
                 (true, None) => Some("O DVR não confirmou a velocidade solicitada."),
                 (true, Some(actual)) if (actual - scale).abs() > 0.001 => {

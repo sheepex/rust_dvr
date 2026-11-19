@@ -57,7 +57,7 @@ fn main() {
             .enable_all()
             .build()
             .unwrap();
-        let result = runtime.block_on(video::run(url, creds, tx.clone(), None, None));
+        let result = runtime.block_on(video::run(url, creds, tx.clone(), None, None, false));
         if let Err(message) = result {
             let _ = tx.send(video::Event::Status(message));
         }

@@ -801,9 +801,16 @@ impl SessionOptions {
 pub struct SetupOptions {
     transport: Transport,
     frame_format: Option<crate::codec::FrameFormat>,
+    onvif_replay: bool,
 }
 
 impl SetupOptions {
+    /// Request ONVIF replay extensions during SETUP.
+    pub fn onvif_replay(mut self, enabled: bool) -> Self {
+        self.onvif_replay = enabled;
+        self
+    }
+
     /// Sets the underlying transport to use.
     #[inline]
     pub fn transport(mut self, transport: Transport) -> Self {
@@ -1850,6 +1857,12 @@ impl Session<Described> {
             .unwrap_or(&inner.presentation.control)
             .clone();
         let mut headers = msg::Headers::default();
+        if options.onvif_replay {
+            headers.insert(
+                msg::HeaderName::REQUIRE,
+                msg::HeaderValue::try_from("onvif-replay").unwrap(),
+            );
+        }
         if sending {
             // ONVIF Streaming Specification section 5.3.1: the `Require`
             // header "shall be included in any request where the server is
@@ -2068,7 +2081,7 @@ impl Session<Described> {
     /// carries the ONVIF backchannel `Require` header, and the caller may send
     /// on it as soon as this returns.
     pub async fn play(self, policy: PlayOptions) -> Result<Session<Playing>, Error> {
-        self.play_impl(policy, None)
+        self.play_impl(policy, None, None)
             .await
             .map(|(session, _, _)| session)
     }
@@ -2093,13 +2106,29 @@ impl Session<Described> {
         if scale.is_some_and(|s| !s.is_finite() || s <= 0.0) {
             return Err(wrap!(ErrorInt::FailedPrecondition("invalid scale".into())));
         }
-        self.play_impl(policy, scale).await
+        self.play_impl(policy, scale, None).await
+    }
+
+    /// Sends PLAY with an explicit RTSP Range, for example an ONVIF UTC clock interval.
+    pub async fn play_with_timing_range(
+        self,
+        policy: PlayOptions,
+        scale: Option<f64>,
+        range: &str,
+    ) -> Result<(Session<Playing>, Option<f64>, Option<String>), Error> {
+        if scale.is_some_and(|s| !s.is_finite() || s <= 0.0) {
+            return Err(wrap!(ErrorInt::FailedPrecondition("invalid scale".into())));
+        }
+        let range = msg::HeaderValue::try_from(range)
+            .map_err(|_| wrap!(ErrorInt::FailedPrecondition("invalid range".into())))?;
+        self.play_impl(policy, scale, Some(range)).await
     }
 
     async fn play_impl(
         mut self,
         policy: PlayOptions,
         scale: Option<f64>,
+        range: Option<msg::HeaderValue>,
     ) -> Result<(Session<Playing>, Option<f64>, Option<String>), Error> {
         let inner = self.0.as_mut().project();
         let conn = inner
@@ -2125,14 +2154,21 @@ impl Session<Described> {
 
         trace!("PLAY with channel mappings: {:#?}", conn.channels);
         *inner.flags |= SessionFlag::MaybePlaying as u8;
+        let onvif_replay = range.is_some();
         let mut headers: msg::Headers = [
             (msg::HeaderName::SESSION, session.id.clone()),
             (
                 msg::HeaderName::RANGE,
-                msg::HeaderValue::try_from("npt=0.000-").unwrap(),
+                range.unwrap_or_else(|| msg::HeaderValue::try_from("npt=0.000-").unwrap()),
             ),
         ]
         .into();
+        if onvif_replay {
+            headers.insert(
+                msg::HeaderName::REQUIRE,
+                msg::HeaderValue::try_from("onvif-replay").unwrap(),
+            );
+        }
         if let Some(scale) = scale {
             headers.insert(
                 msg::HeaderName::try_from("Scale").unwrap(),
@@ -2314,7 +2350,7 @@ impl Session<Described> {
                             })
                         })?,
                         rtp_handler: rtp::InorderParser::new(
-                            ssrc,
+                            if onvif_replay { None } else { ssrc },
                             initial_seq,
                             s.rtp_payload_type,
                             policy.unknown_rtcp_ssrc,

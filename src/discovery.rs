@@ -157,19 +157,51 @@ fn http(equipment: &Equipment, password: &str, path: &str) -> HttpResult {
     let cameras = match equipment.brand {
         Brand::Intelbras => parse_intelbras(&body),
         Brand::Hikvision => parse_hikvision(&body),
-        Brand::Custom => vec![],
+        Brand::Custom | Brand::Onvif => vec![],
     };
     HttpResult::Success(cameras, authenticated)
 }
 
 pub fn discover(equipment: &Equipment, password: String) -> State {
+    if equipment.brand == Brand::Onvif {
+        let host = if equipment.host.contains(':') && !equipment.host.starts_with('[') {
+            format!("[{}]", equipment.host)
+        } else {
+            equipment.host.clone()
+        };
+        let Ok(url) = url::Url::parse(&format!(
+            "http://{host}:{}/onvif/device_service",
+            equipment.http_port
+        )) else {
+            return State::Unknown("Endereço ONVIF inválido.");
+        };
+        let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
+            return State::Unknown("Não foi possível iniciar a verificação ONVIF.");
+        };
+        let credentials = retina::client::Credentials {
+            username: equipment.username.clone(),
+            password,
+        };
+        return match runtime.block_on(crate::onvif::stream_url(&url, &credentials)) {
+            Ok(_) => State::Connected {
+                cameras: Some(vec![Camera {
+                    channel: 1,
+                    name: String::new(),
+                }]),
+            },
+            Err(error) => State::Unknown(error),
+        };
+    }
     let paths: &[&str] = match equipment.brand {
         Brand::Intelbras => &["/cgi-bin/configManager.cgi?action=getConfig&name=ChannelTitle"],
         Brand::Hikvision => &[
             "/ISAPI/ContentMgmt/InputProxy/channels",
             "/ISAPI/System/Video/inputs/channels",
         ],
-        Brand::Custom => &[],
+        Brand::Custom | Brand::Onvif => &[],
     };
     for path in paths {
         match http(equipment, &password, path) {
@@ -301,6 +333,7 @@ mod tests {
             host: "127.0.0.1".into(),
             port: 554,
             http_port: port,
+            utc_offset_minutes: None,
             username: "user".into(),
             channels: 4,
         };
