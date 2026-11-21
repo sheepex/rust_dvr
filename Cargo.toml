@@ -1,9 +1,10 @@
 [package]
-name = "visor-dvr"
+name = "rustdvr"
 version = "0.1.0"
 edition = "2021"
 description = "Visualizador desktop de câmeras de DVRs e NVRs por RTSP"
-default-run = "visor-dvr"
+default-run = "rustdvr"
+license = "GPL-3.0-only"
 
 [dependencies]
 eframe = "0.31"

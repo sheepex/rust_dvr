@@ -328,6 +328,7 @@ mod tests {
         });
         let equipment = Equipment {
             id: "test".into(),
+            disabled: false,
             name: "test".into(),
             brand: Brand::Hikvision,
             host: "127.0.0.1".into(),

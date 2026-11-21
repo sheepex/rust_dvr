@@ -1,4 +1,4 @@
-# Visor DVR
+# RustDVR
 
 Aplicativo desktop em Rust para cadastrar DVRs, NVRs e câmeras e visualizar vídeo ao vivo por RTSP. Oferece modelos de URL para Intelbras e Hikvision e acesso ONVIF para dispositivos compatíveis. Não usa SDK proprietário.
 
@@ -18,13 +18,15 @@ cargo run --release
 
 ### Integração com o Linux
 
-O diretório `packaging/linux` contém o atalho e o ícone do aplicativo. Para uma instalação local, compile com `cargo build --release --bin visor-dvr`, instale o executável em `~/.local/bin/visor-dvr`, o ícone em `~/.local/share/icons/hicolor/scalable/apps/visor-dvr.svg` e o atalho em `~/.local/share/applications/visor-dvr.desktop`. O campo `Exec` do atalho deve apontar para o executável instalado; use um caminho absoluto se `~/.local/bin` não estiver no `PATH` da sessão gráfica. O identificador `visor-dvr` deve ser mantido no nome do atalho, no ícone, em `StartupWMClass` e na janela para associá-los no GNOME.
+O diretório `packaging/linux` contém o atalho e o ícone do aplicativo. Para uma instalação local, compile com `cargo build --release --bin rustdvr`, instale o executável em `~/.local/bin/rustdvr`, o ícone em `~/.local/share/icons/hicolor/scalable/apps/visor-dvr.svg` e o atalho em `~/.local/share/applications/visor-dvr.desktop`. O campo `Exec` do atalho deve apontar para o executável instalado; use um caminho absoluto se `~/.local/bin` não estiver no `PATH` da sessão gráfica. Os identificadores internos `visor-dvr` do atalho, ícone e janela são preservados para compatibilidade com instalações anteriores.
 
 Na aba **Equipamentos**, aberta pelo menu, clique em **Adicionar**, preencha os dados, inclusive a senha, e salve. Na aba **Visualização ao vivo**, aberta por padrão, escolha no fim da lateral esquerda uma grade de 4, 9, 16 ou 25 quadros. Selecione um quadro, expanda o equipamento e dê um duplo clique na câmera. A seleção avança ao próximo quadro, permitindo abrir outras câmeras com duplo clique; após o último, retorna ao primeiro. Dê um duplo clique no quadro para ampliá-lo e outro para retornar à grade anterior sem desconectar os demais. Abrir uma câmera em um quadro ocupado substitui sua transmissão. Ao reduzir a grade, as câmeras dos quadros que deixam de ser exibidos são desconectadas. Para desconectar um quadro, clique nele com o botão direito e escolha **Desconectar**; na lista, a mesma opção fecha todas as exibições daquela câmera. A senha salva é carregada automaticamente. Para alterar os dados ou a senha, clique em **Editar** na lista de equipamentos.
 
 Para um dispositivo **ONVIF**, cadastre o IP, escolha ONVIF na marca e informe o usuário e a senha de acesso local do dispositivo. A porta HTTP cadastrada, normalmente 80, é usada para ONVIF; o dispositivo informa o endereço e a porta RTSP. O aplicativo usa o primeiro perfil ONVIF para vídeo ao vivo, sem alternância automática de qualidade; não faz descoberta de múltiplas câmeras ou canais ONVIF. A reprodução ONVIF é experimental e requer que o dispositivo ofereça uma única gravação através dos serviços de gravação e reprodução. Os horários informados na reprodução são locais ao computador e convertidos em UTC. Alguns dispositivos não confirmam o horário solicitado, portanto confira as imagens. A compatibilidade depende dos recursos, autenticação, codec e configuração do dispositivo. ONVIF e RTSP precisam estar disponíveis; a porta 8000 de gerenciamento não é necessariamente a porta HTTP ONVIF ou RTSP. Exportação ONVIF ainda não está implementada. Cadastros anteriores com a marca EZVIZ são reconhecidos como ONVIF. Senhas de vídeo anteriormente salvas são preservadas no arquivo, mas não são usadas.
 
 Para mudar a ordem dos equipamentos, use **↑** e **↓** na coluna **Ordem** da aba **Equipamentos**. A ordem é salva a cada mudança e vale também para as listas do ao vivo e da reprodução, sem interromper os quadros abertos.
+
+Na coluna **Ativo**, desmarque um equipamento para desconectar suas câmeras e ocultá-lo nas listas de visualização e reprodução. O aplicativo não verifica nem inicia conexões com equipamentos desativados. O cadastro e as senhas são preservados; marque novamente para reativar. Aguarde verificações em andamento e exportações terminarem antes de desativar.
 
 A qualidade é automática: na grade de 4 quadros usa-se o fluxo principal; nas grades de 9, 16 e 25, o secundário para economizar rede e processamento. Ao ampliar um quadro, ele passa ao fluxo principal; os demais continuam no fluxo correspondente à grade. Ao restaurar ou mudar a grade, as transmissões necessárias são reconectadas, o que pode causar uma breve interrupção. A resolução efetiva depende do DVR. Fluxos H.264 e H.265 são suportados, sujeitos às limitações dos decodificadores.
 
@@ -64,9 +66,9 @@ Ao iniciar, o aplicativo verifica os equipamentos em segundo plano e tenta consu
 
 ## Privacidade e limitações
 
-- O `configs.json` e os backups incluem as senhas **sem criptografia**. No Linux, os arquivos criados pelo Visor DVR têm permissão `0600`; mantenha as cópias em local privado e não as compartilhe.
+- O `configs.json` e os backups incluem as senhas **sem criptografia**. No Linux, os arquivos criados pelo RustDVR têm permissão `0600`; mantenha as cópias em local privado e não as compartilhe.
 - RTSP normalmente não criptografa vídeo nem credenciais. Prefira rede local confiável ou VPN; não exponha o DVR diretamente à internet.
-- Cada grade permite até 25 transmissões simultâneas, sujeitas ao desempenho do computador, da rede e do equipamento. Não há áudio nem exclusão de cadastro. A descoberta de canais depende do equipamento; quando indisponível, usa-se a quantidade manual.
+- Cada grade permite até 25 transmissões simultâneas, sujeitas ao desempenho do computador, da rede e do equipamento. Não há áudio. A descoberta de canais depende do equipamento; quando indisponível, usa-se a quantidade manual.
 - A ausência de imagem pode ser causada por caminho RTSP incompatível, rede, autenticação, codec ou RTSP desativado. Alguns perfis e recursos de H.264/H.265 podem ser incompatíveis. O decodificador H.265 documenta suporte aos perfis Main e Main 10, mas não a todos os formatos e extensões, como 4:2:2 e screen content coding.
 
 ## Testes
@@ -74,3 +76,7 @@ Ao iniciar, o aplicativo verifica os equipamentos em segundo plano e tenta consu
 ```sh
 cargo test
 ```
+
+## Licença
+
+O código do RustDVR é distribuído sob a GNU General Public License, versão 3 (GPL-3.0-only). Consulte o arquivo [LICENSE](LICENSE). As dependências e o código de terceiros mantêm suas próprias licenças.

@@ -34,6 +34,8 @@ enum Brand {
 struct Equipment {
     #[serde(default)]
     id: String,
+    #[serde(default)]
+    disabled: bool,
     name: String,
     brand: Brand,
     host: String,
@@ -769,6 +771,7 @@ struct Viewer {
     live_tab_open: bool,
     playback_tab_open: bool,
     edit_open: bool,
+    about_open: bool,
     selected_slot: usize,
     slots: VideoSlots,
     grid_side: usize,
@@ -839,6 +842,7 @@ impl Viewer {
             live_tab_open: true,
             playback_tab_open: false,
             edit_open: false,
+            about_open: false,
             selected_slot: 0,
             slots: std::array::from_fn(|_| VideoSlot::default()),
             grid_side: 2,
@@ -985,6 +989,9 @@ impl Viewer {
     }
 
     fn start_discovery(&mut self, equipment: Equipment, ctx: &egui::Context) {
+        if equipment.disabled {
+            return;
+        }
         self.next_discovery += 1;
         let generation = self.next_discovery;
         self.discovery.insert(
@@ -1032,6 +1039,9 @@ impl Viewer {
     }
 
     fn device_status(&self, equipment: &Equipment) -> &'static str {
+        if equipment.disabled {
+            return "Desativado.";
+        }
         match self.discovery.get(&equipment.id).map(|(_, state)| state) {
             Some(discovery::State::Checking) | None => "Verificando…",
             Some(discovery::State::Connected { cameras: Some(_) }) => {
@@ -1072,7 +1082,12 @@ impl Viewer {
                         .max_height(list_height)
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
-                            for (index, item) in self.equipment.iter().enumerate() {
+                            for (index, item) in self
+                                .equipment
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, item)| !item.disabled)
+                            {
                                 egui::CollapsingHeader::new(self.device_title(item))
                                     .id_salt(("playback_equipment", &item.id))
                                     .show(ui, |ui| {
@@ -1326,6 +1341,9 @@ impl Viewer {
                 .selected
                 .map(|index| self.equipment[index].id.clone())
                 .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+            disabled: self
+                .selected
+                .is_some_and(|index| self.equipment[index].disabled),
             name: self.name.trim().into(),
             brand: self.brand,
             host: self.host.clone(),
@@ -1391,6 +1409,63 @@ impl Viewer {
         remap(&mut self.playback_cameras, first, second);
         if let Some(group) = &mut self.playback_group {
             remap(&mut group.cameras, first, second);
+        }
+        Ok(())
+    }
+
+    fn set_equipment_enabled(
+        &mut self,
+        index: usize,
+        enabled: bool,
+        save: impl FnOnce(&[Equipment], u16, &config::Passwords) -> Result<(), String>,
+    ) -> Result<(), String> {
+        if self.load_failed {
+            return Err("Cadastro não carregado; alteração bloqueada.".into());
+        }
+        let equipment = self
+            .equipment
+            .get(index)
+            .ok_or("Equipamento não encontrado.")?;
+        if !enabled
+            && (self.export_result.is_some()
+                || self
+                    .discovery
+                    .get(&equipment.id)
+                    .is_some_and(|(_, state)| matches!(state, discovery::State::Checking)))
+        {
+            return Err("Aguarde a verificação ou exportação terminar antes de desativar.".into());
+        }
+        let id = equipment.id.clone();
+        let mut updated = self.equipment.clone();
+        updated[index].disabled = !enabled;
+        save(&updated, self.playback_cache_seconds, &self.passwords)?;
+        self.equipment = updated;
+        if !enabled {
+            for slot in self.slots.iter_mut().chain(self.playback_slots.iter_mut()) {
+                if slot
+                    .camera
+                    .as_ref()
+                    .is_some_and(|(camera_id, _)| camera_id == &id)
+                {
+                    slot.stop();
+                }
+            }
+            for camera in &mut self.playback_cameras {
+                if camera.is_some_and(|(item, _)| item == index) {
+                    *camera = None;
+                }
+            }
+            if let Some(group) = &mut self.playback_group {
+                for camera in &mut group.cameras {
+                    if camera.is_some_and(|(item, _)| item == index) {
+                        *camera = None;
+                    }
+                }
+                if group.cameras.iter().all(Option::is_none) {
+                    self.playback_group = None;
+                }
+            }
+            self.discovery.remove(&id);
         }
         Ok(())
     }
@@ -1514,6 +1589,10 @@ impl Viewer {
     }
 
     fn connect(&mut self, ctx: &egui::Context) -> Result<(), String> {
+        let index = self.selected.ok_or("Selecione um equipamento.")?;
+        if self.equipment.get(index).is_none_or(|item| item.disabled) {
+            return Err("Equipamento desativado ou indisponível.".into());
+        }
         let secondary =
             LiveQuality::Auto.use_secondary(self.grid_side, self.expanded_slot, self.selected_slot);
         let url = if self.brand == Brand::Custom {
@@ -1543,7 +1622,6 @@ impl Viewer {
         };
         url.set_username("").map_err(|_| "URL inválida.")?;
         url.set_password(None).map_err(|_| "URL inválida.")?;
-        let index = self.selected.ok_or("Selecione um equipamento.")?;
         self.slots[self.selected_slot].start(
             url,
             credentials,
@@ -1578,6 +1656,9 @@ impl Viewer {
                 .iter()
                 .find(|item| &item.id == id)
                 .ok_or("Não foi possível ajustar o fluxo: equipamento não encontrado.")?;
+            if equipment.disabled {
+                return Err("Equipamento desativado.");
+            }
             let url = camera_url(
                 equipment.brand,
                 &equipment.host,
@@ -1704,6 +1785,9 @@ impl Viewer {
             let result = equipment
                 .ok_or("Equipamento indisponível.")
                 .and_then(|equipment| {
+                    if equipment.disabled {
+                        return Err("Equipamento desativado.");
+                    }
                     let interval = device_playback_interval(
                         equipment.brand,
                         equipment.utc_offset_minutes,
@@ -1801,6 +1885,9 @@ impl Viewer {
             .get(index)
             .ok_or("Equipamento indisponível.")?
             .clone();
+        if equipment.disabled {
+            return Err("Equipamento desativado.".into());
+        }
         if matches!(equipment.brand, Brand::Custom | Brand::Onvif) {
             return Err("Exportação não disponível para este tipo de equipamento.".into());
         }
@@ -2234,6 +2321,10 @@ impl eframe::App for Viewer {
                         self.cache_draft = Some(self.playback_cache_seconds);
                         ui.close_menu();
                     }
+                    if ui.button("Sobre").clicked() {
+                        self.about_open = true;
+                        ui.close_menu();
+                    }
                 });
                 ui.separator();
                 if self.equipment_tab_open {
@@ -2316,7 +2407,7 @@ impl eframe::App for Viewer {
         });
         egui::CentralPanel::default().show(ctx, |ui| {
             if !self.equipment_tab_open && !self.live_tab_open && !self.playback_tab_open {
-                ui.heading("Visor DVR");
+                ui.heading("RustDVR");
                 ui.label("Abra uma aba pelo menu.");
             } else if self.tab == Tab::Equipment {
                 ui.heading("Equipamentos");
@@ -2355,6 +2446,7 @@ impl eframe::App for Viewer {
                 let mut edit = None;
                 let mut reorder = None;
                 let mut remove = None;
+                let mut enabled_change = None;
                 egui::ScrollArea::both().show(ui, |ui| {
                     egui::Grid::new("equipment_table")
                         .striped(true)
@@ -2365,6 +2457,7 @@ impl eframe::App for Viewer {
                             ui.strong("Marca");
                             ui.strong("Porta RTSP");
                             ui.strong("Canais");
+                            ui.strong("Ativo");
                             ui.strong("Ordem");
                             ui.strong("Ação");
                             ui.end_row();
@@ -2386,6 +2479,13 @@ impl eframe::App for Viewer {
                                 let count = self.cameras_for(equipment).len();
                                 ui.label(count.to_string())
                                     .on_hover_text(self.device_status(equipment));
+                                let mut enabled = !equipment.disabled;
+                                if ui.add_enabled(!self.load_failed, egui::Checkbox::without_text(&mut enabled))
+                                    .on_hover_text("Desative para desconectar e ocultar nas listas de câmeras.")
+                                    .changed()
+                                {
+                                    enabled_change = Some((index, enabled));
+                                }
                                 ui.push_id(&equipment.id, |ui| {
                                     ui.horizontal(|ui| {
                                         if order_arrow(ui, !self.load_failed && index > 0, true)
@@ -2426,6 +2526,19 @@ impl eframe::App for Viewer {
                     self.select(index);
                     self.edit_open = true;
                 }
+                if let Some((index, enabled)) = enabled_change {
+                    self.status = match self.set_equipment_enabled(index, enabled, save_config) {
+                        Ok(()) => {
+                            if enabled {
+                                self.start_discovery(self.equipment[index].clone(), ctx);
+                                "Equipamento ativado.".into()
+                            } else {
+                                "Equipamento desativado e desconectado.".into()
+                            }
+                        }
+                        Err(error) => error,
+                    };
+                }
                 if let Some(id) = remove {
                     self.pending_equipment_removal = Some(id);
                 }
@@ -2461,7 +2574,7 @@ impl eframe::App for Viewer {
                                 .max_height(list_height)
                                 .auto_shrink([false, false])
                                 .show(ui, |ui| {
-                                    for (index, item) in self.equipment.iter().enumerate() {
+                                    for (index, item) in self.equipment.iter().enumerate().filter(|(_, item)| !item.disabled) {
                                         egui::CollapsingHeader::new(self.device_title(item))
                                             .id_salt(("camera_tree", &item.id))
                                             .show(ui, |ui| {
@@ -2845,6 +2958,22 @@ impl eframe::App for Viewer {
                 });
             self.edit_open &= open;
         }
+        if self.about_open {
+            egui::Window::new("Sobre")
+                .open(&mut self.about_open)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    ui.heading("RustDVR");
+                    ui.label(format!("Versão {}", env!("CARGO_PKG_VERSION")));
+                    ui.label("Visualização e reprodução de câmeras e gravadores.");
+                    ui.label("Licença: GNU General Public License, versão 3 (GPL-3.0).");
+                    ui.hyperlink_to(
+                        "Texto da licença GPL v3",
+                        "https://www.gnu.org/licenses/gpl-3.0.html",
+                    );
+                    ui.small("Sem garantia; consulte a licença para detalhes.");
+                });
+        }
         let layout = (self.grid_side, self.expanded_slot);
         if layout != self.quality_layout {
             self.quality_layout = layout;
@@ -2883,7 +3012,7 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
     eframe::run_native(
-        "Visor DVR",
+        "RustDVR",
         options,
         Box::new(|_| Ok(Box::<Viewer>::default())),
     )
@@ -3035,11 +3164,97 @@ mod tests {
     }
 
     #[test]
+    fn disabling_equipment_preserves_config_and_stops_only_its_cameras() {
+        let mut viewer = playback_test_viewer();
+        viewer.equipment = ["first", "second"]
+            .map(|id| Equipment {
+                id: id.into(),
+                disabled: false,
+                name: id.into(),
+                brand: Brand::Intelbras,
+                host: "example.com".into(),
+                port: 554,
+                http_port: 80,
+                utc_offset_minutes: None,
+                username: "viewer".into(),
+                channels: 4,
+            })
+            .into();
+        viewer
+            .passwords
+            .insert("first".into(), Zeroizing::new("secret".into()));
+        viewer.playback_cameras[..2].copy_from_slice(&[Some((0, 1)), Some((1, 1))]);
+        let (mut group, _) = playback_test_group(std::time::Instant::now());
+        group.cameras = viewer.playback_cameras;
+        viewer.playback_group = Some(group);
+        viewer.slots[0].camera = Some(("first".into(), 1));
+        viewer.slots[1].camera = Some(("second".into(), 1));
+        viewer.playback_slots[0].camera = Some(("first".into(), 1));
+        assert!(viewer
+            .set_equipment_enabled(0, false, |_, _, _| Err("erro".into()))
+            .is_err());
+        assert!(!viewer.equipment[0].disabled);
+        assert!(viewer.slots[0].camera.is_some());
+        viewer
+            .set_equipment_enabled(0, false, |items, _, passwords| {
+                assert!(items[0].disabled);
+                assert!(passwords.contains_key("first"));
+                Ok(())
+            })
+            .unwrap();
+        assert!(viewer.slots[0].camera.is_none());
+        assert!(viewer.playback_slots[0].camera.is_none());
+        assert!(viewer.slots[1].camera.is_some());
+        assert_eq!(viewer.playback_cameras[..2], [None, Some((1, 1))]);
+        assert_eq!(
+            viewer.playback_group.unwrap().cameras[..2],
+            [None, Some((1, 1))]
+        );
+        viewer.selected = Some(0);
+        assert!(viewer.connect(&egui::Context::default()).is_err());
+        viewer
+            .set_equipment_enabled(0, true, |_, _, _| Ok(()))
+            .unwrap();
+        assert!(!viewer.equipment[0].disabled);
+    }
+
+    #[test]
+    fn disabling_waits_for_discovery_and_export() {
+        let mut viewer = playback_test_viewer();
+        let equipment: Equipment = serde_json::from_str(r#"{"id":"a","name":"a","brand":"Intelbras","host":"example.com","port":554,"username":"u","channels":1}"#).unwrap();
+        assert!(!equipment.disabled);
+        viewer.equipment.push(equipment);
+        viewer
+            .discovery
+            .insert("a".into(), (1, discovery::State::Checking));
+        assert!(viewer
+            .set_equipment_enabled(0, false, |_, _, _| panic!("não deve salvar"))
+            .is_err());
+        viewer.discovery.clear();
+        let (_tx, rx) = mpsc::channel();
+        viewer.export_result = Some(rx);
+        assert!(viewer
+            .set_equipment_enabled(0, false, |_, _, _| panic!("não deve salvar"))
+            .is_err());
+        viewer.export_result = None;
+        viewer
+            .set_equipment_enabled(0, false, |items, _, _| {
+                let json = serde_json::to_string(&items[0]).unwrap();
+                assert!(serde_json::from_str::<Equipment>(&json).unwrap().disabled);
+                Ok(())
+            })
+            .unwrap();
+        viewer.start_discovery(viewer.equipment[0].clone(), &egui::Context::default());
+        assert!(viewer.discovery.is_empty());
+    }
+
+    #[test]
     fn removing_equipment_saves_first_and_preserves_other_selections() {
         let mut viewer = playback_test_viewer();
         viewer.equipment = ["first", "second", "third"]
             .map(|id| Equipment {
                 id: id.into(),
+                disabled: false,
                 name: id.into(),
                 brand: Brand::Intelbras,
                 host: "example.com".into(),
@@ -3100,6 +3315,7 @@ mod tests {
         viewer.equipment = ["first", "second", "third"]
             .map(|id| Equipment {
                 id: id.into(),
+                disabled: false,
                 name: id.into(),
                 brand: Brand::Intelbras,
                 host: "example.com".into(),

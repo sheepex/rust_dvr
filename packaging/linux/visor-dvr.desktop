@@ -1,8 +1,8 @@
 [Desktop Entry]
 Type=Application
-Name=Visor DVR
+Name=RustDVR
 Comment=Visualizador de câmeras DVR e NVR
-Exec=visor-dvr
+Exec=rustdvr
 Icon=visor-dvr
 Terminal=false
 Categories=AudioVideo;Video;

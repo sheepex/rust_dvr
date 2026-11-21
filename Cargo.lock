@@ -3679,6 +3679,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustdvr"
+version = "0.1.0"
+dependencies = [
+ "aes",
+ "digest_auth",
+ "directories",
+ "eframe",
+ "futures",
+ "jiff",
+ "keyring",
+ "oxvif",
+ "reqwest 0.12.28",
+ "retina",
+ "rfd",
+ "roxmltree",
+ "rust_h264",
+ "rust_h265",
+ "serde",
+ "serde_json",
+ "tokio",
+ "url",
+ "uuid",
+ "zeroize",
+]
+
+[[package]]
 name = "rustix"
 version = "0.38.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4663,32 +4689,6 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
-
-[[package]]
-name = "visor-dvr"
-version = "0.1.0"
-dependencies = [
- "aes",
- "digest_auth",
- "directories",
- "eframe",
- "futures",
- "jiff",
- "keyring",
- "oxvif",
- "reqwest 0.12.28",
- "retina",
- "rfd",
- "roxmltree",
- "rust_h264",
- "rust_h265",
- "serde",
- "serde_json",
- "tokio",
- "url",
- "uuid",
- "zeroize",
-]
 
 [[package]]
 name = "walkdir"

@@ -73,8 +73,8 @@ impl<W: Write> Writer<W> {
             &[0x15, 0x49, 0xa9, 0x66],
             &[
                 uint(&[0x2a, 0xd7, 0xb1], 1_000_000),
-                element(&[0x4d, 0x80], b"Visor DVR"),
-                element(&[0x57, 0x41], b"Visor DVR"),
+                element(&[0x4d, 0x80], b"RustDVR"),
+                element(&[0x57, 0x41], b"RustDVR"),
             ],
         );
         out.write_all(&info)?;
