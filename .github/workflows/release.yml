@@ -3,6 +3,8 @@ name: Build and release
 on:
   pull_request:
   push:
+    branches:
+      - main
     tags:
       - 'v*'
   workflow_dispatch:
@@ -25,6 +27,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Verify release version
+        if: github.ref_type == 'tag' && runner.os == 'Linux'
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version="$(cargo metadata --locked --no-deps --format-version 1 | jq -er '.packages[] | select(.name == "rustdvr") | .version')"
+          if [[ "$TAG" != "v$version" ]]; then
+            echo "::error::Tag $TAG does not match Cargo.toml version $version"
+            exit 1
+          fi
       - name: Install Linux build dependencies
         if: runner.os == 'Linux'
         run: |
@@ -72,4 +84,14 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
-        run: gh release create "$TAG" dist/* --title "$TAG" --generate-notes
+        run: |
+          assets=(dist/rustdvr-linux-x86_64.tar.gz dist/rustdvr-windows-x86_64.zip)
+          for asset in "${assets[@]}"; do
+            test -s "$asset"
+          done
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "${assets[@]}" --clobber
+            gh release edit "$TAG" --draft=false
+          else
+            gh release create "$TAG" "${assets[@]}" --verify-tag --title "$TAG" --generate-notes
+          fi
