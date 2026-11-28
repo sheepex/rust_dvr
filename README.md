@@ -77,6 +77,17 @@ Ao iniciar, o aplicativo verifica os equipamentos em segundo plano e tenta consu
 cargo test
 ```
 
+## Releases para Linux e Windows
+
+O GitHub Actions testa e compila o aplicativo em Linux e Windows ao abrir um pull request ou enviar alterações para `main`. O menu **Sobre** mostra a versão de `Cargo.toml`. Para publicar uma nova versão, atualize `Cargo.toml` e `Cargo.lock`, faça o commit e envie a tag correspondente. Por exemplo, para a versão `0.1.1`:
+
+```sh
+git tag -a v0.1.1 -m "Release v0.1.1"
+git push --atomic origin main refs/tags/v0.1.1
+```
+
+Quando os dois builds terminarem, a release aparecerá na página **Releases** do GitHub com um `.tar.gz` para Linux x86_64 e um `.zip` para Windows x86_64. O pacote Linux inclui o executável, o ícone e o atalho; ele ainda depende das bibliotecas gráficas instaladas pela distribuição.
+
 ## Licença
 
 O código do RustDVR é distribuído sob a GNU General Public License, versão 3 (GPL-3.0-only). Consulte o arquivo [LICENSE](LICENSE). As dependências e o código de terceiros mantêm suas próprias licenças.
