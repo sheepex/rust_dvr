@@ -51,8 +51,28 @@ enum ConfigFile<T> {
 }
 
 pub fn path() -> Option<PathBuf> {
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    return std::env::current_exe()
+        .ok()
+        .map(|exe| exe.with_file_name(FILE_NAME));
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    previous_path()
+}
+
+pub fn previous_path() -> Option<PathBuf> {
     directories::ProjectDirs::from("br", "visor-dvr", "visor-dvr")
         .map(|dirs| dirs.config_dir().join(FILE_NAME))
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+pub fn installed_dir() -> Option<PathBuf> {
+    let dirs = directories::BaseDirs::new()?;
+    let application = if cfg!(target_os = "windows") {
+        "RustDVR"
+    } else {
+        "rustdvr"
+    };
+    Some(dirs.data_local_dir().join(application))
 }
 
 pub fn parse<T: DeserializeOwned>(data: &[u8]) -> Result<Config<Vec<T>>, String> {
@@ -76,20 +96,41 @@ pub fn read_import<T: DeserializeOwned>(path: &Path) -> Result<Config<Vec<T>>, S
 }
 
 /// Fall back only if the canonical file is absent, not if it is unreadable or malformed.
-pub fn load_local<T: DeserializeOwned>(path: &Path) -> Result<(Config<Vec<T>>, bool), String> {
+fn find_local<T: DeserializeOwned>(path: &Path) -> Result<Option<(Config<Vec<T>>, bool)>, String> {
     match std::fs::read(path) {
-        Ok(data) => Ok((parse(&Zeroizing::new(data))?, false)),
+        Ok(data) => Ok(Some((parse(&Zeroizing::new(data))?, false))),
         Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
             Err("Não foi possível abrir configs.json.".into())
         }
         Err(_) => match std::fs::read(path.with_file_name(LEGACY_NAME)) {
-            Ok(data) => Ok((parse(&Zeroizing::new(data))?, true)),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                Ok((Config::new(Vec::new(), DEFAULT_CACHE_SECONDS), false))
-            }
+            Ok(data) => Ok(Some((parse(&Zeroizing::new(data))?, true))),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(_) => Err("Não foi possível abrir o cadastro anterior.".into()),
         },
     }
+}
+
+pub fn load_local<T: DeserializeOwned>(path: &Path) -> Result<(Config<Vec<T>>, bool), String> {
+    let previous = previous_path();
+    load_local_with_fallbacks(path, previous.as_slice())
+}
+
+pub fn load_local_with_fallbacks<T: DeserializeOwned>(
+    path: &Path,
+    fallbacks: &[PathBuf],
+) -> Result<(Config<Vec<T>>, bool), String> {
+    if let Some(local) = find_local(path)? {
+        return Ok(local);
+    }
+    for previous in fallbacks
+        .iter()
+        .filter(|previous| previous.as_path() != path)
+    {
+        if let Some((config, _)) = find_local(previous)? {
+            return Ok((config, true));
+        }
+    }
+    Ok((Config::new(Vec::new(), DEFAULT_CACHE_SECONDS), false))
 }
 
 fn prepare_parent(path: &Path) -> Result<(), String> {
@@ -114,6 +155,23 @@ fn write_new(path: &Path, data: &[u8]) -> std::io::Result<()> {
         let _ = std::fs::remove_file(path);
     }
     written
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+pub fn copy_for_install(source: &Path, destination: &Path) -> std::io::Result<bool> {
+    if destination.try_exists()? || destination.with_file_name(LEGACY_NAME).try_exists()? {
+        return Ok(false);
+    }
+    let contents = match std::fs::read(source) {
+        Ok(contents) => Zeroizing::new(contents),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(error) => return Err(error),
+    };
+    match write_atomic(destination, &contents, true) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 pub fn export<T: Serialize>(path: &Path, config: &T) -> Result<(), String> {
@@ -160,8 +218,13 @@ fn save_atomic<T: Serialize>(
     let data = Zeroizing::new(
         serde_json::to_vec_pretty(config).map_err(|_| "Erro ao preparar a configuração.")?,
     );
+    write_atomic(path, &data, create_only)
+        .map_err(|_| "Não foi possível atualizar o arquivo de configuração.".into())
+}
+
+fn write_atomic(path: &Path, data: &[u8], create_only: bool) -> std::io::Result<()> {
     let temporary = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
-    write_new(&temporary, &data).map_err(|_| "Não foi possível salvar a configuração.")?;
+    write_new(&temporary, data)?;
     let result = if create_only {
         // Publish only a complete file, without overwriting a concurrent migration.
         std::fs::hard_link(&temporary, path)
@@ -171,12 +234,36 @@ fn save_atomic<T: Serialize>(
     if create_only || result.is_err() {
         let _ = std::fs::remove_file(&temporary);
     }
-    result.map_err(|_| "Não foi possível atualizar o arquivo de configuração.".into())
+    result
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[test]
+    fn migrates_the_previous_profile_and_keeps_an_existing_installed_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let previous = dir.path().join("previous").join(FILE_NAME);
+        let portable = dir.path().join(FILE_NAME);
+        let installed = dir.path().join("installed").join(FILE_NAME);
+        save(&previous, &Config::new(["previous"], 7)).unwrap();
+        std::fs::create_dir(installed.parent().unwrap()).unwrap();
+        let (settings, needs_migration) =
+            load_local_with_fallbacks::<String>(&portable, std::slice::from_ref(&previous))
+                .unwrap();
+        assert!(needs_migration);
+        migrate(&portable, &settings).unwrap();
+        assert!(copy_for_install(&portable, &installed).unwrap());
+        save(&installed, &Config::new(["installed"], 8)).unwrap();
+        assert!(!copy_for_install(&portable, &installed).unwrap());
+
+        let (settings, needs_migration) =
+            load_local_with_fallbacks::<String>(&installed, &[previous]).unwrap();
+        assert!(!needs_migration);
+        assert_eq!(settings.equipment, ["installed"]);
+    }
 
     #[test]
     fn migration_keeps_legacy_and_never_overwrites_the_new_file() {
@@ -186,11 +273,11 @@ mod tests {
         let path = dir.join(FILE_NAME);
         let original = br#"{"playback_cache_seconds":11,"equipment":["a","b"]}"#;
         std::fs::write(&legacy, original).unwrap();
-        let (settings, from_legacy) = load_local::<String>(&path).unwrap();
+        let (settings, from_legacy) = load_local_with_fallbacks::<String>(&path, &[]).unwrap();
         assert!(from_legacy);
         migrate(&path, &settings).unwrap();
         assert_eq!(std::fs::read(&legacy).unwrap(), original);
-        let (settings, from_legacy) = load_local::<String>(&path).unwrap();
+        let (settings, from_legacy) = load_local_with_fallbacks::<String>(&path, &[]).unwrap();
         assert!(!from_legacy);
         assert_eq!(settings.equipment, ["a", "b"]);
         assert_eq!(settings.playback_cache_seconds, 11);
@@ -198,7 +285,7 @@ mod tests {
         assert!(export(&path, &Config::new(["other"], 7)).is_err());
 
         std::fs::write(&path, b"invalid").unwrap();
-        assert!(load_local::<String>(&path).is_err());
+        assert!(load_local_with_fallbacks::<String>(&path, &[]).is_err());
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

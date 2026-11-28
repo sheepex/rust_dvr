@@ -53,6 +53,7 @@ jobs:
           cp target/release/rustdvr README.md LICENSE dist/rustdvr-linux-x86_64/
           cp -r packaging/linux dist/rustdvr-linux-x86_64/packaging/
           tar -C dist -czf dist/rustdvr-linux-x86_64.tar.gz rustdvr-linux-x86_64
+          cp target/release/rustdvr dist/rustdvr-update-linux-x86_64
       - name: Package Windows
         if: runner.os == 'Windows'
         shell: pwsh
@@ -60,12 +61,14 @@ jobs:
           New-Item -ItemType Directory -Force dist/rustdvr-windows-x86_64 | Out-Null
           Copy-Item target/release/rustdvr.exe, README.md, LICENSE dist/rustdvr-windows-x86_64/
           Compress-Archive -Path dist/rustdvr-windows-x86_64 -DestinationPath dist/rustdvr-windows-x86_64.zip
+          Copy-Item target/release/rustdvr.exe dist/rustdvr-update-windows-x86_64.exe
       - uses: actions/upload-artifact@v4
         with:
           name: rustdvr-${{ matrix.os }}-x86_64
           path: |
             dist/*.tar.gz
             dist/*.zip
+            dist/rustdvr-update-*
           if-no-files-found: error
 
   release:
@@ -85,7 +88,12 @@ jobs:
           GH_REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
         run: |
-          assets=(dist/rustdvr-linux-x86_64.tar.gz dist/rustdvr-windows-x86_64.zip)
+          assets=(
+            dist/rustdvr-linux-x86_64.tar.gz
+            dist/rustdvr-windows-x86_64.zip
+            dist/rustdvr-update-linux-x86_64
+            dist/rustdvr-update-windows-x86_64.exe
+          )
           for asset in "${assets[@]}"; do
             test -s "$asset"
           done

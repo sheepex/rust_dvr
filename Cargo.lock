@@ -3680,7 +3680,7 @@ dependencies = [
 
 [[package]]
 name = "rustdvr"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aes",
  "digest_auth",
@@ -3696,11 +3696,15 @@ dependencies = [
  "roxmltree",
  "rust_h264",
  "rust_h265",
+ "semver",
  "serde",
  "serde_json",
+ "sha2",
+ "tempfile",
  "tokio",
  "url",
  "uuid",
+ "windows",
  "zeroize",
 ]
 

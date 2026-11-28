@@ -2,6 +2,8 @@ use eframe::egui;
 mod config;
 mod discovery;
 mod export;
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+mod maintenance;
 mod onvif;
 mod playback;
 mod video;
@@ -91,7 +93,7 @@ fn load_config() -> Result<LocalConfig, String> {
     let changed = assign_missing_equipment_ids(&mut config.equipment);
     if legacy {
         config::migrate(&path, &config)
-            .map_err(|_| "Não foi possível migrar equipamentos.json para configs.json.")?;
+            .map_err(|_| "Não foi possível migrar as configurações para a pasta do executável.")?;
     } else if changed || import_passwords {
         config::save(&path, &config)
             .map_err(|_| "Não foi possível atualizar o cadastro existente.")?;
@@ -149,15 +151,6 @@ fn validate_import(
         });
     }
     Ok(imported)
-}
-
-fn save_config(
-    equipment: &[Equipment],
-    playback_cache_seconds: u16,
-    passwords: &config::Passwords,
-) -> Result<(), String> {
-    let path = config::path().ok_or("Pasta de configuração indisponível.")?;
-    save_config_at(&path, equipment, playback_cache_seconds, passwords)
 }
 
 fn save_config_at(
@@ -772,6 +765,8 @@ struct Viewer {
     playback_tab_open: bool,
     edit_open: bool,
     about_open: bool,
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    maintenance: Option<maintenance::Maintenance>,
     selected_slot: usize,
     slots: VideoSlots,
     grid_side: usize,
@@ -843,6 +838,8 @@ impl Viewer {
             playback_tab_open: false,
             edit_open: false,
             about_open: false,
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
+            maintenance: None,
             selected_slot: 0,
             slots: std::array::from_fn(|_| VideoSlot::default()),
             grid_side: 2,
@@ -890,6 +887,25 @@ impl Viewer {
 }
 
 impl Viewer {
+    fn config_path(&self) -> Result<std::path::PathBuf, String> {
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        if let Some(path) = self
+            .maintenance
+            .as_ref()
+            .and_then(maintenance::Maintenance::moved_config)
+        {
+            return Ok(path.to_path_buf());
+        }
+        config::path().ok_or_else(|| "Pasta de configuração indisponível.".into())
+    }
+
+    fn config_writer(
+        &self,
+    ) -> impl FnOnce(&[Equipment], u16, &config::Passwords) -> Result<(), String> {
+        let path = self.config_path();
+        move |equipment, cache, passwords| save_config_at(&path?, equipment, cache, passwords)
+    }
+
     fn equipment_password(&self, id: &str) -> Option<String> {
         self.passwords
             .get(id)
@@ -973,8 +989,8 @@ impl Viewer {
                     });
                 });
             if confirm && open && !cancel {
-                let result = config::path()
-                    .ok_or_else(|| "Pasta de configuração indisponível.".to_owned())
+                let result = self
+                    .config_path()
                     .and_then(|path| self.apply_config_import(&path, imported));
                 self.status = match result {
                     Ok(()) => {
@@ -1367,7 +1383,7 @@ impl Viewer {
         } else {
             updated.push(equipment);
         }
-        match save_config(&updated, self.playback_cache_seconds, &passwords) {
+        match self.config_writer()(&updated, self.playback_cache_seconds, &passwords) {
             Ok(()) => {
                 self.selected = Some(if self.selected.is_some() {
                     self.selected.unwrap()
@@ -1555,7 +1571,8 @@ impl Viewer {
                 });
             });
         if confirm && open && !cancel {
-            self.status = match self.remove_equipment(&id, save_config) {
+            let save = self.config_writer();
+            self.status = match self.remove_equipment(&id, save) {
                 Ok(()) => "Equipamento removido.".into(),
                 Err(error) => error,
             };
@@ -2527,7 +2544,8 @@ impl eframe::App for Viewer {
                     self.edit_open = true;
                 }
                 if let Some((index, enabled)) = enabled_change {
-                    self.status = match self.set_equipment_enabled(index, enabled, save_config) {
+                    let save = self.config_writer();
+                    self.status = match self.set_equipment_enabled(index, enabled, save) {
                         Ok(()) => {
                             if enabled {
                                 self.start_discovery(self.equipment[index].clone(), ctx);
@@ -2543,7 +2561,8 @@ impl eframe::App for Viewer {
                     self.pending_equipment_removal = Some(id);
                 }
                 if let Some((first, second)) = reorder {
-                    self.status = match self.swap_equipment(first, second, save_config) {
+                    let save = self.config_writer();
+                    self.status = match self.swap_equipment(first, second, save) {
                         Ok(()) => "Ordem dos equipamentos salva.".into(),
                         Err(error) => error,
                     };
@@ -2812,7 +2831,7 @@ impl eframe::App for Viewer {
                     });
                 });
             if save {
-                match save_config(&self.equipment, seconds, &self.passwords) {
+                match self.config_writer()(&self.equipment, seconds, &self.passwords) {
                     Ok(()) => {
                         self.playback_cache_seconds = seconds;
                         self.status = format!("Cache da reprodução salvo: {seconds} s por câmera.");
@@ -2972,7 +2991,16 @@ impl eframe::App for Viewer {
                         "https://www.gnu.org/licenses/gpl-3.0.html",
                     );
                     ui.small("Sem garantia; consulte a licença para detalhes.");
+                    #[cfg(any(target_os = "linux", target_os = "windows"))]
+                    if let Some(maintenance) = &mut self.maintenance {
+                        ui.separator();
+                        maintenance.about(ui);
+                    }
                 });
+        }
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        if let Some(maintenance) = &mut self.maintenance {
+            maintenance.show(ctx, self.export_result.is_none());
         }
         let layout = (self.grid_side, self.expanded_slot);
         if layout != self.quality_layout {
@@ -2983,6 +3011,10 @@ impl eframe::App for Viewer {
 }
 
 fn main() -> eframe::Result {
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    if maintenance::handle_internal_command() {
+        return Ok(());
+    }
     if std::env::args_os()
         .nth(1)
         .is_some_and(|arg| arg == "--migrar-config")
@@ -3011,11 +3043,32 @@ fn main() -> eframe::Result {
             .with_inner_size([1000.0, 600.0]),
         ..Default::default()
     };
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    let (restart_tx, restart_rx) = mpsc::channel::<maintenance::Restart>();
     eframe::run_native(
         "RustDVR",
         options,
-        Box::new(|_| Ok(Box::<Viewer>::default())),
-    )
+        Box::new(move |_context| {
+            let viewer = Viewer::default();
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
+            let viewer = {
+                let mut viewer = viewer;
+                viewer.maintenance = Some(maintenance::Maintenance::new(
+                    &_context.egui_ctx,
+                    restart_tx,
+                ));
+                viewer
+            };
+            Ok(Box::new(viewer))
+        }),
+    )?;
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    if let Ok(restart) = restart_rx.try_recv() {
+        if let Err(error) = restart.apply() {
+            maintenance::report_error("Falha ao atualizar o RustDVR", &error.to_string());
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

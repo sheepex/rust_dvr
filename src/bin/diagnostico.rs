@@ -21,7 +21,11 @@ fn main() {
         eprintln!("Pasta de configuração indisponível.");
         return;
     };
-    let Ok((config, _)) = config::load_local::<Equipment>(&path) else {
+    let mut fallbacks = Vec::new();
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    fallbacks.extend(config::installed_dir().map(|dir| dir.join(config::FILE_NAME)));
+    fallbacks.extend(config::previous_path());
+    let Ok((config, _)) = config::load_local_with_fallbacks::<Equipment>(&path, &fallbacks) else {
         eprintln!("Cadastro inválido.");
         return;
     };

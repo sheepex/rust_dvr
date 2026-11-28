@@ -16,9 +16,18 @@ O projeto utiliza `eframe` para a interface, `retina` para RTSP e as bibliotecas
 cargo run --release
 ```
 
-### Integração com o Linux
+### Instalação e atualização
 
-O diretório `packaging/linux` contém o atalho e o ícone do aplicativo. Para uma instalação local, compile com `cargo build --release --bin rustdvr`, instale o executável em `~/.local/bin/rustdvr`, o ícone em `~/.local/share/icons/hicolor/scalable/apps/visor-dvr.svg` e o atalho em `~/.local/share/applications/visor-dvr.desktop`. O campo `Exec` do atalho deve apontar para o executável instalado; use um caminho absoluto se `~/.local/bin` não estiver no `PATH` da sessão gráfica. Os identificadores internos `visor-dvr` do atalho, ícone e janela são preservados para compatibilidade com instalações anteriores.
+Na primeira execução no Linux ou no Windows, escolha **Instalar** ou **Apenas executar**. A instalação usa a conta atual e pode ser feita mais tarde pelo menu **Sobre**. Esse menu também permite recriar os atalhos.
+
+| Sistema | Pasta padrão | Atalhos |
+| --- | --- | --- |
+| Linux | `~/.local/share/rustdvr` ou `$XDG_DATA_HOME/rustdvr` | Menu de aplicativos, com o arquivo `.desktop` e o ícone em pastas XDG |
+| Windows | `%LOCALAPPDATA%\RustDVR` | Área de Trabalho e Programas no menu Iniciar |
+
+O `configs.json` fica na mesma pasta do executável no Linux e no Windows. Ao abrir uma versão nova pela primeira vez, o aplicativo pode copiar configurações da pasta usada pelas versões anteriores. Ao instalar a partir da versão portátil, o programa também copia as configurações locais se a pasta de instalação ainda não tiver as suas. Os arquivos anteriores são preservados. Na execução portátil, extraia o aplicativo em uma pasta gravável para salvar configurações e aplicar atualizações.
+
+Ao abrir o aplicativo no Linux ou no Windows x86_64, ele consulta a release estável mais recente do GitHub em segundo plano. Se houver uma versão nova, escolha **Baixar atualização**. Depois de verificar o download, o RustDVR pergunta se pode fechar e reabrir. **Mais tarde** mantém a versão atual aberta, e **Sobre → Concluir atualização** volta a oferecer o reinício enquanto o programa estiver aberto.
 
 Na aba **Equipamentos**, aberta pelo menu, clique em **Adicionar**, preencha os dados, inclusive a senha, e salve. Na aba **Visualização ao vivo**, aberta por padrão, escolha no fim da lateral esquerda uma grade de 4, 9, 16 ou 25 quadros. Selecione um quadro, expanda o equipamento e dê um duplo clique na câmera. A seleção avança ao próximo quadro, permitindo abrir outras câmeras com duplo clique; após o último, retorna ao primeiro. Dê um duplo clique no quadro para ampliá-lo e outro para retornar à grade anterior sem desconectar os demais. Abrir uma câmera em um quadro ocupado substitui sua transmissão. Ao reduzir a grade, as câmeras dos quadros que deixam de ser exibidos são desconectadas. Para desconectar um quadro, clique nele com o botão direito e escolha **Desconectar**; na lista, a mesma opção fecha todas as exibições daquela câmera. A senha salva é carregada automaticamente. Para alterar os dados ou a senha, clique em **Editar** na lista de equipamentos.
 
@@ -79,14 +88,14 @@ cargo test
 
 ## Releases para Linux e Windows
 
-O GitHub Actions testa e compila o aplicativo em Linux e Windows ao abrir um pull request ou enviar alterações para `main`. O menu **Sobre** mostra a versão de `Cargo.toml`. Para publicar uma nova versão, atualize `Cargo.toml` e `Cargo.lock`, faça o commit e envie a tag correspondente. Por exemplo, para a versão `0.1.1`:
+O GitHub Actions testa e compila o aplicativo em Linux e Windows ao abrir um pull request ou enviar alterações para `main`. O menu **Sobre** mostra a versão de `Cargo.toml`. Para publicar uma nova versão, atualize `Cargo.toml` e `Cargo.lock`, faça o commit e envie a tag correspondente. Por exemplo, para a versão `0.2.0`:
 
 ```sh
-git tag -a v0.1.1 -m "Release v0.1.1"
-git push --atomic origin main refs/tags/v0.1.1
+git tag -a v0.2.0 -m "Release v0.2.0"
+git push --atomic origin main refs/tags/v0.2.0
 ```
 
-Quando os dois builds terminarem, a release aparecerá na página **Releases** do GitHub com um `.tar.gz` para Linux x86_64 e um `.zip` para Windows x86_64. O pacote Linux inclui o executável, o ícone e o atalho; ele ainda depende das bibliotecas gráficas instaladas pela distribuição.
+Quando os dois builds terminarem, a release aparecerá na página **Releases** do GitHub com um `.tar.gz` para Linux x86_64 e um `.zip` para Windows x86_64. O pacote Linux inclui o executável, o ícone e o atalho e depende das bibliotecas gráficas instaladas pela distribuição. O workflow também publica os executáveis usados pelo atualizador, com nomes iniciados por `rustdvr-update-`. O aplicativo só aplica um download cujo tamanho e SHA-256 correspondam aos informados pelo GitHub.
 
 ## Licença
 

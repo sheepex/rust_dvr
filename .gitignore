@@ -1,3 +1,5 @@
 /target
 configs.json
+configs.*.bak.json
+configs.*.tmp
 equipamentos.json
